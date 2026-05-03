@@ -29,7 +29,7 @@ class WeightSource(Protocol):
         """Release all resources (buffers, readers, events)."""
         ...
 
-    def prefetch(self, idx: int) -> None:
+    def prefetch(self, idx: int, min_keep_idx: int | None = None) -> None:
         """Start loading weights for block *idx* if supported."""
         ...
 
@@ -64,10 +64,23 @@ class DiskWeightSource(WeightSource):
             self._cache[idx] = weights
         return weights
 
-    def _acquire_slot_locked(self, allow_evict: bool = True) -> dict[str, torch.Tensor] | None:
+    def _acquire_slot_locked(
+        self,
+        allow_evict: bool = True,
+        evict_before_idx: int | None = None,
+    ) -> dict[str, torch.Tensor] | None:
         if allow_evict and self._pool.free_count == 0 and self._cache:
-            evicted_idx, evicted_weights = self._cache.popitem(last=False)
-            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
+            evicted_idx = None
+            if evict_before_idx is not None:
+                for candidate_idx in self._cache:
+                    if candidate_idx < evict_before_idx:
+                        evicted_idx = candidate_idx
+                        break
+            else:
+                evicted_idx = next(iter(self._cache))
+            if evicted_idx is not None:
+                evicted_weights = self._cache.pop(evicted_idx)
+                self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
         if self._pool.free_count == 0:
             return None
         return self._pool.acquire()
@@ -84,20 +97,24 @@ class DiskWeightSource(WeightSource):
                 raise RuntimeError(f"No free streaming weight buffers available for block {idx}")
         return self._fill_block(idx, weights)
 
-    def prefetch(self, idx: int) -> None:
+    def prefetch(self, idx: int, min_keep_idx: int | None = None) -> None:
         if not self._reader.has_block(idx):
             return
         with self._lock:
             if idx in self._cache or idx in self._prefetches:
                 return
-            weights = self._acquire_slot_locked(allow_evict=False)
+            weights = self._acquire_slot_locked(
+                allow_evict=min_keep_idx is not None,
+                evict_before_idx=min_keep_idx,
+            )
             if weights is None:
                 return
             self._prefetches[idx] = self._executor.submit(self._fill_block, idx, weights)
 
     def release(self, idx: int, event: torch.cuda.Event) -> None:
         """Attach an H2D event -- waited before this buffer is recycled."""
-        self._events[idx] = event
+        with self._lock:
+            self._events[idx] = event
 
     def cleanup(self) -> None:
         """Clear cache and close the disk reader."""
@@ -128,7 +145,7 @@ class PinnedWeightSource(WeightSource):
     def cleanup(self) -> None:
         self._weights.clear()
 
-    def prefetch(self, idx: int) -> None:
+    def prefetch(self, idx: int, min_keep_idx: int | None = None) -> None:
         pass
 
     def __len__(self) -> int:

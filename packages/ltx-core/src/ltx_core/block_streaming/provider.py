@@ -60,10 +60,11 @@ class WeightsProvider:
 
     def prime(self) -> None:
         """Start loading the first few blocks before the first forward hook."""
-        warm_blocks = min(self._pool.capacity, self._block_count or self._pool.capacity)
+        warm_blocks = min(self._prefetch_blocks + 1, self._block_count or (self._prefetch_blocks + 1))
         for idx in range(warm_blocks):
             self._source.prefetch(idx)
-            self._ensure_gpu_prefetch(idx)
+            if idx < self._pool.capacity:
+                self._ensure_gpu_prefetch(idx)
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return GPU weights for block *idx*, waiting for any async prefetch."""
@@ -93,7 +94,7 @@ class WeightsProvider:
             prefetch_idx = idx + offset
             if self._block_count is not None and prefetch_idx >= self._block_count:
                 break
-            self._source.prefetch(prefetch_idx)
+            self._source.prefetch(prefetch_idx, min_keep_idx=idx)
             if offset <= self._gpu_prefetch_blocks:
                 self._ensure_gpu_prefetch(prefetch_idx)
 
