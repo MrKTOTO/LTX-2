@@ -7,6 +7,7 @@ removes the need for :class:`ModelLedger`.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
@@ -65,6 +66,7 @@ from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShap
 from ltx_core.utils import find_matching_file
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
+    cleanup_device_memory,
     cleanup_memory,
     create_noised_state,
     generate_enhanced_prompt,
@@ -89,13 +91,16 @@ def _streaming_model(
     offload_mode: OffloadMode,
     target_device: torch.device,
     dtype: torch.dtype,
+    staging_device: torch.device | None = None,
 ) -> Iterator:
     """Build a streaming wrapper, yield it, then tear down and free memory."""
-    cpu_slots_count = DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None
+    disk_cpu_slots = int(os.environ.get("LTX_STREAM_CPU_SLOTS", DISK_CPU_SLOTS))
+    cpu_slots_count = max(2, disk_cpu_slots) if offload_mode == OffloadMode.DISK else None
     wrapped = builder.build(
         target_device=target_device,
         dtype=dtype,
         cpu_slots_count=cpu_slots_count,
+        staging_device=staging_device,
     )
     try:
         yield wrapped
@@ -154,6 +159,7 @@ class DiffusionStage:
         registry: Registry | None = None,
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        staging_device: torch.device | None = None,
     ) -> None:
         if offload_mode != OffloadMode.NONE:
             if torch_compile:
@@ -174,6 +180,7 @@ class DiffusionStage:
 
         self._dtype = dtype
         self._device = device
+        self._staging_device = staging_device
         self._quantization = quantization
         self._torch_compile = torch_compile
         self._offload_mode = offload_mode
@@ -216,7 +223,13 @@ class DiffusionStage:
 
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            return _streaming_model(self._streaming_builder, self._offload_mode, self._device, self._dtype)
+            return _streaming_model(
+                self._streaming_builder,
+                self._offload_mode,
+                self._device,
+                self._dtype,
+                staging_device=self._staging_device,
+            )
         return gpu_model(self._build_transformer(**kwargs))
 
     def model_context(self, **kwargs: object) -> AbstractContextManager:
@@ -357,12 +370,16 @@ class PromptEncoder:
         gemma_root: str,
         dtype: torch.dtype,
         device: torch.device,
+        embeddings_processor_device: torch.device | None = None,
         registry: Registry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        text_encoder_staging_device: torch.device | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
+        self._embeddings_processor_device = embeddings_processor_device or device
         self._offload_mode = offload_mode
+        self._text_encoder_staging_device = text_encoder_staging_device
 
         module_ops = module_ops_from_gemma_root(gemma_root)
         model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
@@ -393,8 +410,34 @@ class PromptEncoder:
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            return _streaming_model(self._streaming_text_encoder_builder, self._offload_mode, self._device, self._dtype)
+            return _streaming_model(
+                self._streaming_text_encoder_builder,
+                self._offload_mode,
+                self._device,
+                self._dtype,
+                staging_device=self._text_encoder_staging_device,
+            )
         return gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval())
+
+    def _move_raw_outputs(
+        self,
+        raw_outputs: list[tuple[tuple[torch.Tensor, ...], torch.Tensor]],
+    ) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
+        if self._embeddings_processor_device == self._device:
+            return raw_outputs
+
+        moved_outputs = []
+        for hidden_states, attention_mask in raw_outputs:
+            moved_hidden_states = tuple(
+                hidden_state.to(self._embeddings_processor_device, non_blocking=True)
+                for hidden_state in hidden_states
+            )
+            moved_mask = attention_mask.to(self._embeddings_processor_device, non_blocking=True)
+            moved_outputs.append((moved_hidden_states, moved_mask))
+
+        del raw_outputs
+        cleanup_device_memory(self._device)
+        return moved_outputs
 
     def __call__(
         self,
@@ -413,8 +456,14 @@ class PromptEncoder:
                 )
             raw_outputs = [text_encoder.encode(p) for p in prompts]
 
+        raw_outputs = self._move_raw_outputs(raw_outputs)
         with gpu_model(
-            self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+            self._embeddings_processor_builder.build(
+                device=self._embeddings_processor_device,
+                dtype=self._dtype,
+            )
+            .to(self._embeddings_processor_device)
+            .eval()
         ) as embeddings_processor:
             return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
 

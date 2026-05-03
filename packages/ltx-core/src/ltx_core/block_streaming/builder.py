@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Generic
@@ -10,7 +11,7 @@ from typing import Generic
 import torch
 from torch import nn
 
-from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource
+from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource, block_cache_namespace
 from ltx_core.block_streaming.pool import BlockLayout, WeightPool
 from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, WeightSource
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 DISK_CPU_SLOTS = 2
 _DEFAULT_GPU_SLOTS = 2
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         dtype: torch.dtype,
         cpu_slots_count: int | None = None,
         gpu_slots_count: int | None = None,
+        staging_device: torch.device | None = None,
         **_kwargs: object,
     ) -> BlockStreamingWrapper:
         """Build and return a ready-to-use :class:`BlockStreamingWrapper`.
@@ -122,20 +131,39 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
         # 2. Determine slot counts.
         cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else len(blocks)
-        gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _DEFAULT_GPU_SLOTS
+        gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _env_int(
+            "LTX_STREAM_GPU_SLOTS",
+            _DEFAULT_GPU_SLOTS,
+        )
 
         # 3. Build source and load non-block weights.
         if cpu_slots_count >= len(blocks):
             source, lora_sources = self._build_pinned_source(meta_model, target_device, dtype, cpu_slots_count)
         else:
-            source, lora_sources = self._build_disk_source(meta_model, layout, target_device, dtype, cpu_slots_count)
+            source, lora_sources = self._build_disk_source(
+                meta_model,
+                layout,
+                target_device,
+                dtype,
+                cpu_slots_count,
+                staging_device=staging_device,
+            )
 
         # 4. Create provider and wrapper.
         copy_stream = torch.cuda.Stream(device=target_device)
         gpu_pool = WeightPool(
             layout, gpu_slots_count, target_device, reuse_barrier=lambda event: copy_stream.wait_event(event)
         )
-        provider = WeightsProvider(gpu_pool, copy_stream, target_device, source, lora_sources, self.blocks_prefix)
+        provider = WeightsProvider(
+            gpu_pool,
+            copy_stream,
+            target_device,
+            source,
+            lora_sources,
+            self.blocks_prefix,
+            prefetch_blocks=_env_int("LTX_STREAM_PREFETCH_BLOCKS", 0, minimum=0),
+            block_count=len(blocks),
+        )
         return BlockStreamingWrapper(
             model=meta_model,
             blocks=blocks,
@@ -149,6 +177,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         target_device: torch.device,
         dtype: torch.dtype,
         cpu_slots_count: int,
+        staging_device: torch.device | None = None,
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Pre-load all blocks into pinned CPU buffers with LoRA fusion."""
         model_sd = load_state_dict(
@@ -208,6 +237,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         target_device: torch.device,
         dtype: torch.dtype,
         cpu_slots_count: int,
+        staging_device: torch.device | None = None,
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Create a DiskWeightSource backed by a DiskBlockReader for lazy loading."""
         lora_sources = [LoraSource(lora.path, lora.sd_ops, lora.strength) for lora in self.loras]
@@ -245,14 +275,47 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             matmul_device=target_device,
         )
 
+        staging_device_name = os.environ.get("LTX_STREAM_STAGING_DEVICE")
+        staging_device = staging_device or (torch.device(staging_device_name) if staging_device_name else torch.device("cpu"))
+        if staging_device == target_device:
+            staging_device = torch.device("cpu")
+        if staging_device.type == "cuda" and target_device.type == "cuda":
+            staging_idx = staging_device.index if staging_device.index is not None else torch.cuda.current_device()
+            target_idx = target_device.index if target_device.index is not None else torch.cuda.current_device()
+            if not torch.cuda.can_device_access_peer(target_idx, staging_idx):
+                logger.warning(
+                    "CUDA staging device %s cannot peer-copy to compute device %s; "
+                    "falling back to pinned CPU staging",
+                    staging_device,
+                    target_device,
+                )
+                staging_device = torch.device("cpu")
+        pin_memory = staging_device.type == "cpu"
+        if staging_device.type == "cuda":
+            logger.info(
+                "Using CUDA staging device %s for disk-streamed block weights before compute device %s",
+                staging_device,
+                target_device,
+            )
+
         cpu_pool = WeightPool(
             layout,
             cpu_slots_count,
-            torch.device("cpu"),
+            staging_device,
             reuse_barrier=lambda event: event.synchronize(),
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
-        block_reader = DiskBlockReader(reader=reader, block_key_map=block_key_map, dtype=dtype)
+        cache_dir = os.environ.get("LTX_STREAM_BLOCK_CACHE_DIR")
+        cache_namespace = block_cache_namespace(checkpoint_paths, self.blocks_prefix, dtype) if cache_dir else None
+        if cache_dir:
+            logger.info("Using disk block cache at %s/%s", cache_dir, cache_namespace)
+        block_reader = DiskBlockReader(
+            reader=reader,
+            block_key_map=block_key_map,
+            dtype=dtype,
+            cache_dir=cache_dir,
+            cache_namespace=cache_namespace,
+        )
         source = DiskWeightSource(cpu_pool, block_reader)
         return source, lora_sources
 

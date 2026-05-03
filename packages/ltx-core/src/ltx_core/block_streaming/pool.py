@@ -46,6 +46,10 @@ class WeightPool:
     def capacity(self) -> int:
         return self._capacity
 
+    @property
+    def free_count(self) -> int:
+        return len(self._free)
+
     def acquire(self) -> dict[str, torch.Tensor]:
         """Take a free buffer, waiting any pending event before returning."""
         weights = self._free.popleft()

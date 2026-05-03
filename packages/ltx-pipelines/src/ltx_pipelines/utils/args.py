@@ -247,6 +247,46 @@ def basic_arg_parser(
             "Example: --offload cpu"
         ),
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Primary compute device for diffusion, image conditioning, upsampling, "
+            "and decoding. Defaults to the current CUDA device when available. "
+            "Example: --device cuda:1"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-encoder-device",
+        type=str,
+        default=None,
+        help=(
+            "Device for Gemma prompt encoding and the embeddings processor. "
+            "Defaults to --device. Example: --prompt-encoder-device cuda:0"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-encoder-staging-device",
+        type=str,
+        default=None,
+        help=(
+            "Optional staging GPU for Gemma prompt encoder streamed weights. "
+            "Useful when prompt encoding runs on one GPU and another GPU is idle. "
+            "Example: --prompt-encoder-staging-device cuda:1"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-encoder-offload",
+        dest="prompt_encoder_offload_mode",
+        type=OffloadMode,
+        default=None,
+        choices=list(OffloadMode),
+        help=(
+            "Weight offloading strategy for Gemma prompt encoding only. "
+            "Defaults to --offload. Example: --prompt-encoder-offload disk"
+        ),
+    )
 
     parser.add_argument(
         "--max-batch-size",

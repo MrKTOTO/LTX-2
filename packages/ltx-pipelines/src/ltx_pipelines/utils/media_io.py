@@ -326,12 +326,15 @@ def encode_video(
     output_path: str,
     video_chunks_number: int,
 ) -> None:
+    logger.info("Preparing video encoder for %s chunk(s)", video_chunks_number)
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
+    logger.info("Fetching first decoded video chunk")
     first_chunk = next(video)
 
     _, height, width, _ = first_chunk.shape
+    logger.info("Opening output container %s (%sx%s @ %s fps)", output_path, width, height, fps)
 
     container = av.open(output_path, mode="w")
     stream = container.add_stream("libx264", rate=int(fps))
@@ -340,6 +343,7 @@ def encode_video(
     stream.pix_fmt = "yuv420p"
 
     if audio is not None:
+        logger.info("Preparing audio stream at %s Hz", audio.sampling_rate)
         audio_stream = _prepare_audio_stream(container, audio.sampling_rate)
 
     def all_tiles(
@@ -348,7 +352,9 @@ def encode_video(
         yield first_chunk
         yield from tiles_generator
 
-    for video_chunk in tqdm(all_tiles(first_chunk, video), total=video_chunks_number):
+    logger.info("Encoding video chunks")
+    for chunk_index, video_chunk in enumerate(tqdm(all_tiles(first_chunk, video), total=video_chunks_number), start=1):
+        logger.info("Encoding video chunk %s/%s", chunk_index, video_chunks_number)
         video_chunk_cpu = video_chunk.to("cpu").numpy()
         for frame_array in video_chunk_cpu:
             frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
@@ -356,12 +362,15 @@ def encode_video(
                 container.mux(packet)
 
     # Flush encoder
+    logger.info("Flushing video encoder")
     for packet in stream.encode():
         container.mux(packet)
 
     if audio is not None:
+        logger.info("Writing audio stream")
         _write_audio(container, audio_stream, audio)
 
+    logger.info("Closing output container")
     container.close()
     logger.info(f"Video saved to {output_path}")
 

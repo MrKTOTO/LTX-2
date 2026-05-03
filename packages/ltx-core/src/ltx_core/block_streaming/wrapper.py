@@ -41,6 +41,7 @@ class BlockStreamingWrapper(nn.Module):
 
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._register_hooks()
+        self._provider.prime()
 
     # ------------------------------------------------------------------
     # Hook registration

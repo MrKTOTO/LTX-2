@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+import os
+from threading import Lock
+import time
 
 import torch
 
@@ -30,34 +34,116 @@ class WeightsProvider:
         source: WeightSource,
         lora_sources: list[LoraSource] | None = None,
         blocks_prefix: str = "",
+        prefetch_blocks: int = 1,
+        block_count: int | None = None,
     ) -> None:
         self._copy_stream = copy_stream
         self._pool = pool
         self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
         self._events: dict[int, torch.cuda.Event] = {}
+        self._ready_events: dict[int, torch.cuda.Event] = {}
+        self._in_use: set[int] = set()
         self._target_device = target_device
         self._source = source
         self._lora_sources = lora_sources or []
         self._blocks_prefix = blocks_prefix
+        self._prefetch_blocks = prefetch_blocks
+        self._block_count = block_count
+        self._lock = Lock()
+        self._gpu_prefetch_blocks = max(0, min(prefetch_blocks, self._pool.capacity - 1))
+        gpu_prefetch_workers = max(1, int(os.environ.get("LTX_STREAM_GPU_PREFETCH_WORKERS", "1")))
+        self._executor = ThreadPoolExecutor(
+            max_workers=gpu_prefetch_workers,
+            thread_name_prefix="ltx-gpu-prefetch",
+        )
+        self._prefetches: dict[int, Future[None]] = {}
+
+    def prime(self) -> None:
+        """Start loading the first few blocks before the first forward hook."""
+        warm_blocks = min(self._pool.capacity, self._block_count or self._pool.capacity)
+        for idx in range(warm_blocks):
+            self._source.prefetch(idx)
+            self._ensure_gpu_prefetch(idx)
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return GPU weights for block *idx*. Does H2D copy on miss."""
-        if idx in self._cache:
-            return self._cache[idx]
+        """Return GPU weights for block *idx*, waiting for any async prefetch."""
+        with self._lock:
+            future = None if idx in self._cache else self._prefetches.get(idx)
 
-        # Evict oldest GPU buffer if at capacity.
-        if len(self._cache) >= self._pool.capacity:
-            evicted_idx, evicted_weights = self._cache.popitem(last=False)
-            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
+        if future is not None:
+            future.result()
+        else:
+            with self._lock:
+                cache_hit = idx in self._cache
+            if not cache_hit:
+                self._load_to_gpu(idx)
 
-        gpu_weights = self._pool.acquire()
-        cpu_weights = self._source.get(idx)
+        with self._lock:
+            gpu_weights = self._cache[idx]
+            ready_event = self._ready_events.get(idx)
+            self._in_use.add(idx)
 
-        h2d_event = self._copy_to_gpu(idx, gpu_weights, cpu_weights)
-        self._source.release(idx, event=h2d_event)
-
-        self._cache[idx] = gpu_weights
+        if ready_event is not None:
+            torch.cuda.current_stream(self._target_device).wait_event(ready_event)
+        self._prefetch(idx)
         return gpu_weights
+
+    def _prefetch(self, idx: int) -> None:
+        for offset in range(1, self._prefetch_blocks + 1):
+            prefetch_idx = idx + offset
+            if self._block_count is not None and prefetch_idx >= self._block_count:
+                break
+            self._source.prefetch(prefetch_idx)
+            if offset <= self._gpu_prefetch_blocks:
+                self._ensure_gpu_prefetch(prefetch_idx)
+
+    def _ensure_gpu_prefetch(self, idx: int) -> Future[None] | None:
+        if self._block_count is not None and (idx < 0 or idx >= self._block_count):
+            return None
+        with self._lock:
+            if idx in self._cache:
+                return None
+            future = self._prefetches.get(idx)
+            if future is not None:
+                return future
+            future = self._executor.submit(self._load_to_gpu, idx)
+            self._prefetches[idx] = future
+            return future
+
+    def _load_to_gpu(self, idx: int) -> None:
+        try:
+            cpu_weights = self._source.get(idx)
+            gpu_weights = self._acquire_gpu_slot()
+            h2d_event = self._copy_to_gpu(idx, gpu_weights, cpu_weights)
+            self._source.release(idx, event=h2d_event)
+            with self._lock:
+                self._cache[idx] = gpu_weights
+                self._ready_events[idx] = h2d_event
+                self._cache.move_to_end(idx)
+                self._prefetches.pop(idx, None)
+        except Exception:
+            with self._lock:
+                self._prefetches.pop(idx, None)
+            raise
+
+    def _acquire_gpu_slot(self) -> dict[str, torch.Tensor]:
+        while True:
+            with self._lock:
+                while len(self._cache) >= self._pool.capacity:
+                    evicted_idx = None
+                    for candidate_idx in self._cache:
+                        if candidate_idx not in self._in_use:
+                            evicted_idx = candidate_idx
+                            break
+                    if evicted_idx is None:
+                        break
+                    evicted_weights = self._cache.pop(evicted_idx)
+                    ready_event = self._ready_events.pop(evicted_idx, None)
+                    compute_event = self._events.pop(evicted_idx, None)
+                    self._pool.release(evicted_weights, event=compute_event or ready_event)
+                if self._pool.free_count > 0:
+                    return self._pool.acquire()
+            time.sleep(0.001)
 
     def _copy_to_gpu(
         self,
@@ -69,7 +155,7 @@ class WeightsProvider:
         The wait is intentionally inside this method so callers -- and
         instrumentation regions wrapping it -- observe the full transfer time.
         """
-        with torch.cuda.stream(self._copy_stream):
+        with torch.inference_mode(), torch.cuda.stream(self._copy_stream):
             for name, gpu_tensor in gpu_weights.items():
                 gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
             if self._lora_sources:
@@ -77,19 +163,26 @@ class WeightsProvider:
             h2d_event = torch.cuda.Event()
             h2d_event.record(self._copy_stream)
 
-        torch.cuda.current_stream(self._target_device).wait_event(h2d_event)
         return h2d_event
 
     def release(self, idx: int, event: torch.cuda.Event) -> None:
         """Attach a compute-done event -- waited before this buffer is recycled."""
-        self._events[idx] = event
+        with self._lock:
+            self._in_use.discard(idx)
+            self._events[idx] = event
 
     def cleanup(self) -> None:
         """Synchronize streams and release all resources."""
+        for future in self._prefetches.values():
+            future.cancel()
+        self._prefetches.clear()
+        self._executor.shutdown(wait=False, cancel_futures=True)
         self._copy_stream.synchronize()
         torch.cuda.current_stream(self._target_device).synchronize()
         self._cache.clear()
         self._events.clear()
+        self._ready_events.clear()
+        self._in_use.clear()
         self._source.cleanup()
         for lora in self._lora_sources:
             lora.cleanup()

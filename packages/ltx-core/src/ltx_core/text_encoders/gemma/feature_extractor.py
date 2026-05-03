@@ -71,16 +71,23 @@ def norm_and_concat_per_token_rms(
         [B, T, D*L] normalized tensor with padding zeroed out.
     """
     B, T, D, L = encoded_text.shape  # noqa: N806
-    variance = torch.mean(encoded_text**2, dim=2, keepdim=True)  # [B,T,1,L]
-    normed = encoded_text * torch.rsqrt(variance + 1e-6)
+    rms_denom = torch.linalg.vector_norm(encoded_text, ord=2, dim=2, keepdim=True)
+    rms_denom = rms_denom * (D**-0.5)
+    normed = encoded_text / (rms_denom + 1e-6)
     normed = normed.reshape(B, T, D * L)
     mask_3d = attention_mask.bool().unsqueeze(-1)  # [B, T, 1]
-    return torch.where(mask_3d, normed, torch.zeros_like(normed))
+    normed.masked_fill_(~mask_3d, 0)
+    return normed
 
 
 def _rescale_norm(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
     """Rescale normalization: x * sqrt(target_dim / source_dim)."""
     return x * math.sqrt(target_dim / source_dim)
+
+
+def _rescale_norm_(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
+    """In-place variant used in low-VRAM inference paths."""
+    return x.mul_(math.sqrt(target_dim / source_dim))
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +140,12 @@ class FeatureExtractorV2(nn.Module):
         normed = norm_and_concat_per_token_rms(encoded, attention_mask)
         normed = normed.to(encoded.dtype)
         v_dim = self.video_aggregate_embed.out_features
-        video = self.video_aggregate_embed(_rescale_norm(normed, v_dim, self.embedding_dim))
+        _rescale_norm_(normed, v_dim, self.embedding_dim)
+        video = self.video_aggregate_embed(normed)
         audio = None
         if self.audio_aggregate_embed is not None:
             a_dim = self.audio_aggregate_embed.out_features
-            audio = self.audio_aggregate_embed(_rescale_norm(normed, a_dim, self.embedding_dim))
+            if a_dim != v_dim:
+                normed.mul_(math.sqrt(a_dim / v_dim))
+            audio = self.audio_aggregate_embed(normed)
         return video, audio

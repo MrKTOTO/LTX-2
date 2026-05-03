@@ -35,6 +35,8 @@ def get_device() -> torch.device:
 
 def cleanup_memory() -> None:
     gc.collect()
+    if not torch.cuda.is_available():
+        return
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     try:
@@ -42,6 +44,15 @@ def cleanup_memory() -> None:
             torch._C._host_emptyCache()
     except Exception:
         logging.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+
+
+def cleanup_device_memory(device: torch.device) -> None:
+    gc.collect()
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:
