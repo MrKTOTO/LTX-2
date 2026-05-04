@@ -141,9 +141,11 @@ def generate_freqs(
     return freqs
 
 
-def split_freqs_cis(freqs: torch.Tensor, pad_size: int, num_attention_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
-    cos_freq = freqs.cos()
-    sin_freq = freqs.sin()
+def split_freqs_cis(
+    freqs: torch.Tensor, pad_size: int, num_attention_heads: int, out_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos_freq = freqs.cos().to(out_dtype)
+    sin_freq = freqs.sin_().to(out_dtype)
 
     if pad_size != 0:
         cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
@@ -164,9 +166,9 @@ def split_freqs_cis(freqs: torch.Tensor, pad_size: int, num_attention_heads: int
     return cos_freq, sin_freq
 
 
-def interleaved_freqs_cis(freqs: torch.Tensor, pad_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
-    sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
+def interleaved_freqs_cis(freqs: torch.Tensor, pad_size: int, out_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    cos_freq = freqs.cos().to(out_dtype).repeat_interleave(2, dim=-1)
+    sin_freq = freqs.sin_().to(out_dtype).repeat_interleave(2, dim=-1)
     if pad_size != 0:
         cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
         sin_padding = torch.zeros_like(cos_freq[:, :, :pad_size])
@@ -196,9 +198,9 @@ def precompute_freqs_cis(
         expected_freqs = dim // 2
         current_freqs = freqs.shape[-1]
         pad_size = expected_freqs - current_freqs
-        cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads)
+        cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads, out_dtype)
     else:
         # 2 because of cos and sin by 3 for (t, x, y), 1 for temporal only
         n_elem = 2 * indices_grid.shape[1]
-        cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem)
-    return cos_freq.to(out_dtype), sin_freq.to(out_dtype)
+        cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem, out_dtype)
+    return cos_freq, sin_freq

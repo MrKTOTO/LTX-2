@@ -44,6 +44,39 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def _unique_devices(devices: list[torch.device]) -> list[torch.device]:
+    unique: list[torch.device] = []
+    for device in devices:
+        if device not in unique:
+            unique.append(device)
+    return unique
+
+
+def _block_device_map(devices: list[torch.device], block_count: int) -> list[torch.device]:
+    if not devices:
+        raise ValueError("At least one block streaming device is required")
+    strategy = os.environ.get("LTX_STREAM_BLOCK_DEVICE_STRATEGY", "contiguous").strip().lower()
+    if strategy == "round_robin":
+        return [devices[idx % len(devices)] for idx in range(block_count)]
+
+    placement: list[torch.device] = []
+    for idx in range(block_count):
+        device_idx = min(len(devices) - 1, idx * len(devices) // block_count)
+        placement.append(devices[device_idx])
+    return placement
+
+
+def _resolve_block_devices(
+    target_device: torch.device,
+    block_count: int,
+    block_devices: list[torch.device] | None = None,
+) -> list[torch.device]:
+    if not block_devices:
+        return [target_device] * block_count
+    devices = block_devices
+    return _block_device_map(devices, block_count)
+
+
 @dataclass(frozen=True)
 class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType]):
     """Immutable builder for :class:`BlockStreamingWrapper`.
@@ -105,6 +138,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         cpu_slots_count: int | None = None,
         gpu_slots_count: int | None = None,
         staging_device: torch.device | None = None,
+        block_devices: list[torch.device] | None = None,
         **_kwargs: object,
     ) -> BlockStreamingWrapper:
         """Build and return a ready-to-use :class:`BlockStreamingWrapper`.
@@ -149,26 +183,43 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 staging_device=staging_device,
             )
 
-        # 4. Create provider and wrapper.
-        copy_stream = torch.cuda.Stream(device=target_device)
-        gpu_pool = WeightPool(
-            layout, gpu_slots_count, target_device, reuse_barrier=lambda event: copy_stream.wait_event(event)
-        )
-        provider = WeightsProvider(
-            gpu_pool,
-            copy_stream,
-            target_device,
-            source,
-            lora_sources,
-            self.blocks_prefix,
-            prefetch_blocks=_env_int("LTX_STREAM_PREFETCH_BLOCKS", 0, minimum=0),
-            block_count=len(blocks),
-        )
+        # 4. Create provider(s) and wrapper.
+        resolved_block_devices = _resolve_block_devices(target_device, len(blocks), block_devices)
+        provider_devices = _unique_devices(resolved_block_devices)
+        if provider_devices != [target_device]:
+            logger.info(
+                "Using model-parallel block devices: %s",
+                ",".join(str(device) for device in provider_devices),
+            )
+        providers: dict[torch.device, WeightsProvider] = {}
+        prefetch_blocks = _env_int("LTX_STREAM_PREFETCH_BLOCKS", 0, minimum=0)
+        for device in provider_devices:
+            copy_stream = torch.cuda.Stream(device=device)
+            gpu_pool = WeightPool(
+                layout, gpu_slots_count, device, reuse_barrier=lambda event, stream=copy_stream: stream.wait_event(event)
+            )
+            providers[device] = WeightsProvider(
+                gpu_pool,
+                copy_stream,
+                device,
+                source,
+                lora_sources,
+                self.blocks_prefix,
+                prefetch_blocks=prefetch_blocks,
+                block_count=len(blocks),
+                owns_source=len(provider_devices) == 1,
+                owns_lora_sources=len(provider_devices) == 1,
+            )
+        provider: WeightsProvider | dict[torch.device, WeightsProvider]
+        provider = providers[target_device] if provider_devices == [target_device] else providers
         return BlockStreamingWrapper(
             model=meta_model,
             blocks=blocks,
             provider=provider,
             target_device=target_device,
+            block_devices=resolved_block_devices,
+            shared_source=source if len(provider_devices) > 1 else None,
+            shared_lora_sources=lora_sources if len(provider_devices) > 1 else None,
         )
 
     def _build_pinned_source(

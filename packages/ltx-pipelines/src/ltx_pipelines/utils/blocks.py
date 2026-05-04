@@ -92,6 +92,7 @@ def _streaming_model(
     target_device: torch.device,
     dtype: torch.dtype,
     staging_device: torch.device | None = None,
+    block_devices: list[torch.device] | None = None,
 ) -> Iterator:
     """Build a streaming wrapper, yield it, then tear down and free memory."""
     disk_cpu_slots = int(os.environ.get("LTX_STREAM_CPU_SLOTS", DISK_CPU_SLOTS))
@@ -101,6 +102,7 @@ def _streaming_model(
         dtype=dtype,
         cpu_slots_count=cpu_slots_count,
         staging_device=staging_device,
+        block_devices=block_devices,
     )
     try:
         yield wrapped
@@ -160,6 +162,7 @@ class DiffusionStage:
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
         staging_device: torch.device | None = None,
+        block_devices: list[torch.device] | None = None,
     ) -> None:
         if offload_mode != OffloadMode.NONE:
             if torch_compile:
@@ -181,6 +184,7 @@ class DiffusionStage:
         self._dtype = dtype
         self._device = device
         self._staging_device = staging_device
+        self._block_devices = block_devices
         self._quantization = quantization
         self._torch_compile = torch_compile
         self._offload_mode = offload_mode
@@ -229,6 +233,7 @@ class DiffusionStage:
                 self._device,
                 self._dtype,
                 staging_device=self._staging_device,
+                block_devices=self._block_devices,
             )
         return gpu_model(self._build_transformer(**kwargs))
 

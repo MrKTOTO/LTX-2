@@ -1,4 +1,6 @@
 from dataclasses import dataclass, replace
+import logging
+import os
 
 import torch
 
@@ -11,20 +13,40 @@ from ltx_core.model.transformer.rope import (
     precompute_freqs_cis,
 )
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CompressedTimestep:
+    values: torch.Tensor
+    indices: torch.Tensor
+    batch_size: int
+    token_count: int
+
+    def expand(self) -> torch.Tensor:
+        expanded = self.values.index_select(0, self.indices)
+        return expanded.view(self.batch_size, self.token_count, -1)
+
+    def expand_token_range(self, start: int, end: int) -> torch.Tensor:
+        index_view = self.indices.view(self.batch_size, self.token_count)
+        chunk_indices = index_view[:, start:end].reshape(-1)
+        expanded = self.values.index_select(0, chunk_indices)
+        return expanded.view(self.batch_size, end - start, -1)
+
 
 @dataclass(frozen=True)
 class TransformerArgs:
     x: torch.Tensor
     context: torch.Tensor
     context_mask: torch.Tensor
-    timesteps: torch.Tensor
-    embedded_timestep: torch.Tensor
+    timesteps: torch.Tensor | CompressedTimestep
+    embedded_timestep: torch.Tensor | CompressedTimestep
     positional_embeddings: torch.Tensor
     cross_positional_embeddings: torch.Tensor | None
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
-    prompt_timestep: torch.Tensor | None = None
+    prompt_timestep: torch.Tensor | CompressedTimestep | None = None
     self_attention_mask: torch.Tensor | None = (
         None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
     )
@@ -61,16 +83,36 @@ class TransformerArgsPreprocessor:
 
     def _prepare_timestep(
         self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | CompressedTimestep, torch.Tensor | CompressedTimestep]:
         """Prepare timestep embeddings."""
-        timestep_scaled = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = adaln(
-            timestep_scaled.flatten(),
+        timestep_scaled = (timestep * self.timestep_scale_multiplier).flatten()
+        unique_timesteps, inverse_indices = torch.unique(timestep_scaled, sorted=True, return_inverse=True)
+        timestep_values, embedded_values = adaln(
+            unique_timesteps,
             hidden_dtype=hidden_dtype,
         )
-        # Second dimension is 1 or number of tokens (if timestep_per_token)
-        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
+        token_count = timestep_scaled.numel() // batch_size
+        if os.environ.get("LTX_LOG_TIMESTEP_COMPRESSION", "").strip():
+            logger.info(
+                "Compressed AdaLN timesteps: tokens=%d, unique=%d, ada_dim=%d, embedded_dim=%d",
+                timestep_scaled.numel(),
+                unique_timesteps.numel(),
+                timestep_values.shape[-1],
+                embedded_values.shape[-1],
+            )
+
+        timestep = CompressedTimestep(
+            values=timestep_values,
+            indices=inverse_indices,
+            batch_size=batch_size,
+            token_count=token_count,
+        )
+        embedded_timestep = CompressedTimestep(
+            values=embedded_values,
+            indices=inverse_indices,
+            batch_size=batch_size,
+            token_count=token_count,
+        )
 
         return timestep, embedded_timestep
 
@@ -133,6 +175,18 @@ class TransformerArgsPreprocessor:
     ) -> torch.Tensor:
         """Prepare positional embeddings."""
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
+        original_device = positions.device
+        scratch_device_name = os.environ.get("LTX_ROPE_SCRATCH_DEVICE", "").strip()
+        scratch_device = None
+        if scratch_device_name:
+            candidate = torch.device(scratch_device_name)
+            if candidate != original_device:
+                scratch_device = candidate
+
+        if scratch_device is not None:
+            logger.info("Preparing RoPE positional embeddings on scratch device %s", scratch_device)
+            positions = positions.to(scratch_device)
+
         pe = precompute_freqs_cis(
             positions,
             dim=inner_dim,
@@ -144,7 +198,17 @@ class TransformerArgsPreprocessor:
             rope_type=self.rope_type,
             freq_grid_generator=freq_grid_generator,
         )
+        if scratch_device is not None:
+            pe = tuple(self._move_rope_tensor(tensor, original_device) for tensor in pe)
         return pe
+
+    @staticmethod
+    def _move_rope_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if tensor.device == device:
+            return tensor
+        if tensor.device.type == "cuda" and device.type == "cuda":
+            return tensor.detach().to("cpu").to(device)
+        return tensor.detach().to(device)
 
     def prepare(
         self,

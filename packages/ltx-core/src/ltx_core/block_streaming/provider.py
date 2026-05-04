@@ -36,6 +36,8 @@ class WeightsProvider:
         blocks_prefix: str = "",
         prefetch_blocks: int = 1,
         block_count: int | None = None,
+        owns_source: bool = True,
+        owns_lora_sources: bool = True,
     ) -> None:
         self._copy_stream = copy_stream
         self._pool = pool
@@ -46,15 +48,23 @@ class WeightsProvider:
         self._target_device = target_device
         self._source = source
         self._lora_sources = lora_sources or []
+        self._owns_source = owns_source
+        self._owns_lora_sources = owns_lora_sources
         self._blocks_prefix = blocks_prefix
         self._prefetch_blocks = prefetch_blocks
         self._block_count = block_count
         self._lock = Lock()
-        self._gpu_prefetch_blocks = max(0, min(prefetch_blocks, self._pool.capacity - 1))
-        gpu_prefetch_workers = max(1, int(os.environ.get("LTX_STREAM_GPU_PREFETCH_WORKERS", "1")))
-        self._executor = ThreadPoolExecutor(
-            max_workers=gpu_prefetch_workers,
-            thread_name_prefix="ltx-gpu-prefetch",
+        gpu_prefetch_workers = max(0, int(os.environ.get("LTX_STREAM_GPU_PREFETCH_WORKERS", "1")))
+        self._gpu_prefetch_blocks = (
+            max(0, min(prefetch_blocks, self._pool.capacity - 1)) if gpu_prefetch_workers > 0 else 0
+        )
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=gpu_prefetch_workers,
+                thread_name_prefix="ltx-gpu-prefetch",
+            )
+            if gpu_prefetch_workers > 0
+            else None
         )
         self._prefetches: dict[int, Future[None]] = {}
 
@@ -63,7 +73,7 @@ class WeightsProvider:
         warm_blocks = min(self._prefetch_blocks + 1, self._block_count or (self._prefetch_blocks + 1))
         for idx in range(warm_blocks):
             self._source.prefetch(idx)
-            if idx < self._pool.capacity:
+            if idx < self._pool.capacity and self._executor is not None:
                 self._ensure_gpu_prefetch(idx)
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
@@ -95,11 +105,13 @@ class WeightsProvider:
             if self._block_count is not None and prefetch_idx >= self._block_count:
                 break
             self._source.prefetch(prefetch_idx, min_keep_idx=idx)
-            if offset <= self._gpu_prefetch_blocks:
+            if offset <= self._gpu_prefetch_blocks and self._executor is not None:
                 self._ensure_gpu_prefetch(prefetch_idx)
 
     def _ensure_gpu_prefetch(self, idx: int) -> Future[None] | None:
         if self._block_count is not None and (idx < 0 or idx >= self._block_count):
+            return None
+        if self._executor is None:
             return None
         with self._lock:
             if idx in self._cache:
@@ -177,16 +189,19 @@ class WeightsProvider:
         for future in self._prefetches.values():
             future.cancel()
         self._prefetches.clear()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
         self._copy_stream.synchronize()
         torch.cuda.current_stream(self._target_device).synchronize()
         self._cache.clear()
         self._events.clear()
         self._ready_events.clear()
         self._in_use.clear()
-        self._source.cleanup()
-        for lora in self._lora_sources:
-            lora.cleanup()
+        if self._owns_source:
+            self._source.cleanup()
+        if self._owns_lora_sources:
+            for lora in self._lora_sources:
+                lora.cleanup()
 
     def __len__(self) -> int:
         return len(self._cache)

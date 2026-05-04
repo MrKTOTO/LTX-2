@@ -1,4 +1,5 @@
 from enum import Enum
+import os
 from typing import Protocol
 
 import torch
@@ -177,7 +178,14 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
-    def forward(
+    @staticmethod
+    def _out_chunk_tokens() -> int:
+        try:
+            return max(1, int(os.environ.get("LTX_ATTENTION_OUT_CHUNK_TOKENS", "2048")))
+        except ValueError:
+            return 2048
+
+    def _attention_out(
         self,
         x: torch.Tensor,
         context: torch.Tensor | None = None,
@@ -187,30 +195,6 @@ class Attention(torch.nn.Module):
         perturbation_mask: torch.Tensor | None = None,
         all_perturbed: bool = False,
     ) -> torch.Tensor:
-        """Multi-head attention with optional RoPE, perturbation masking, and per-head gating.
-        When ``perturbation_mask`` is all zeros, the expensive query/key path
-        (linear projections, RMSNorm, RoPE) is skipped entirely and only the
-        value projection is used as a pass-through.
-        Args:
-            x: Query input tensor of shape ``(B, T, query_dim)``.
-            context: Key/value context tensor of shape ``(B, S, context_dim)``.
-                Falls back to ``x`` (self-attention) when *None*.
-            mask: Optional attention mask. Interpretation depends on the attention
-                backend (additive bias for xformers/PyTorch SDPA).
-            pe: Rotary positional embeddings applied to both ``q`` and ``k``.
-            k_pe: Separate rotary positional embeddings for ``k`` only. When
-                *None*, ``pe`` is reused for keys.
-            perturbation_mask: Optional mask in ``[0, 1]`` that
-                blends the attention output with the raw value projection:
-                ``out = attn_out * mask + v * (1 - mask)``.
-                **1** keeps the full attention output, **0** bypasses attention
-                and passes the value projection through unchanged.
-                *None* or all-ones means standard attention; all-zeros skips
-                the query/key path entirely for efficiency.
-            all_perturbed: Whether all perturbations are active for this block.
-        Returns:
-            Output tensor of shape ``(B, T, query_dim)``.
-        """
         context = x if context is None else context
         use_attention = not all_perturbed
 
@@ -241,9 +225,70 @@ class Attention(torch.nn.Module):
             # Reshape to (B, T, H, D) for per-head gating
             out = out.view(b, t, self.heads, self.dim_head)
             # Apply gating: 2 * sigmoid(x) so that zero-init gives identity (2 * 0.5 = 1.0)
-            gates = 2.0 * torch.sigmoid(gate_logits)  # (B, T, H)
-            out = out * gates.unsqueeze(-1)  # (B, T, H, D) * (B, T, H, 1)
+            gates = torch.sigmoid(gate_logits)  # (B, T, H)
+            gates.mul_(2.0)
+            out.mul_(gates.unsqueeze(-1))  # (B, T, H, D) * (B, T, H, 1)
             # Reshape back to (B, T, H*D)
             out = out.view(b, t, self.heads * self.dim_head)
+            del gate_logits, gates
 
+        return out
+
+    def add_to_residual(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        outer_gate: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: torch.Tensor | None = None,
+        k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
+    ) -> torch.Tensor:
+        """Project attention output in token chunks and add it into residual.
+        This avoids holding both the full pre-projection attention tensor and a
+        full post-projection copy at the same time.
+        """
+        out = self._attention_out(
+            x,
+            context=context,
+            mask=mask,
+            pe=pe,
+            k_pe=k_pe,
+            perturbation_mask=perturbation_mask,
+            all_perturbed=all_perturbed,
+        )
+        chunk_tokens = self._out_chunk_tokens()
+        tokens = out.shape[1]
+        for start in range(0, tokens, chunk_tokens):
+            stop = min(start + chunk_tokens, tokens)
+            projected = self.to_out(out[:, start:stop, :])
+            if outer_gate is not None:
+                projected.mul_(outer_gate[:, start:stop, :])
+            residual[:, start:stop, :].add_(projected)
+            del projected
+        del out
+        return residual
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: torch.Tensor | None = None,
+        k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
+    ) -> torch.Tensor:
+        """Multi-head attention with optional RoPE, perturbation masking, and per-head gating."""
+        out = self._attention_out(
+            x,
+            context=context,
+            mask=mask,
+            pe=pe,
+            k_pe=k_pe,
+            perturbation_mask=perturbation_mask,
+            all_perturbed=all_perturbed,
+        )
         return self.to_out(out)

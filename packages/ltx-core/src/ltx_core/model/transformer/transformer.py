@@ -7,7 +7,7 @@ from ltx_core.model.transformer.adaln import adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.feed_forward import FeedForward
 from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer_args import TransformerArgs
+from ltx_core.model.transformer.transformer_args import CompressedTimestep, TransformerArgs
 from ltx_core.utils import rms_norm
 
 
@@ -124,15 +124,25 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.norm_eps = norm_eps
 
     def get_ada_values(
-        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice
+        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor | CompressedTimestep, indices: slice
     ) -> tuple[torch.Tensor, ...]:
         num_ada_params = scale_shift_table.shape[0]
 
-        ada_values = (
-            scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
-        ).unbind(dim=2)
-        return ada_values
+        if isinstance(timestep, CompressedTimestep):
+            values = timestep.values.view(timestep.values.shape[0], num_ada_params, -1)[:, indices, :]
+            table = scale_shift_table[indices].to(device=values.device, dtype=values.dtype)
+            return tuple(
+                (values[:, value_idx, :] + table[value_idx]).index_select(0, timestep.indices).view(
+                    timestep.batch_size,
+                    timestep.token_count,
+                    -1,
+                )
+                for value_idx in range(values.shape[1])
+            )
+
+        selected = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
+        table = scale_shift_table[indices].to(device=timestep.device, dtype=timestep.dtype)
+        return tuple(selected[:, :, value_idx, :] + table[value_idx] for value_idx in range(selected.shape[2]))
 
     def get_av_ca_ada_values(
         self,
@@ -211,7 +221,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
             )
-            norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
+            norm_vx = rms_norm(vx, eps=self.norm_eps)
+            norm_vx.mul_(1 + vscale_msa)
+            norm_vx.add_(vshift_msa)
             del vshift_msa, vscale_msa
 
             all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
@@ -221,19 +233,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 if not all_perturbed and not none_perturbed
                 else None
             )
-            vx = (
-                vx
-                + self.attn1(
-                    norm_vx,
-                    pe=video.positional_embeddings,
-                    mask=video.self_attention_mask,
-                    perturbation_mask=v_mask,
-                    all_perturbed=all_perturbed,
-                )
-                * vgate_msa
+            self.attn1.add_to_residual(
+                vx,
+                norm_vx,
+                outer_gate=vgate_msa,
+                pe=video.positional_embeddings,
+                mask=video.self_attention_mask,
+                perturbation_mask=v_mask,
+                all_perturbed=all_perturbed,
             )
             del vgate_msa, norm_vx, v_mask
-            vx = vx + self._apply_text_cross_attention(
+            apply_text_cross_attention_to_residual(
+                vx,
                 vx,
                 video.context,
                 self.attn2,
@@ -243,6 +254,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 video.prompt_timestep,
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
+                norm_eps=self.norm_eps,
             )
 
         if run_ax:
@@ -250,7 +262,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
             )
 
-            norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
+            norm_ax = rms_norm(ax, eps=self.norm_eps)
+            norm_ax.mul_(1 + ascale_msa)
+            norm_ax.add_(ashift_msa)
             del ashift_msa, ascale_msa
             all_perturbed = perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
             none_perturbed = not perturbations.any_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
@@ -259,19 +273,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 if not all_perturbed and not none_perturbed
                 else None
             )
-            ax = (
-                ax
-                + self.audio_attn1(
-                    norm_ax,
-                    pe=audio.positional_embeddings,
-                    mask=audio.self_attention_mask,
-                    perturbation_mask=a_mask,
-                    all_perturbed=all_perturbed,
-                )
-                * agate_msa
+            self.audio_attn1.add_to_residual(
+                ax,
+                norm_ax,
+                outer_gate=agate_msa,
+                pe=audio.positional_embeddings,
+                mask=audio.self_attention_mask,
+                perturbation_mask=a_mask,
+                all_perturbed=all_perturbed,
             )
             del agate_msa, norm_ax, a_mask
-            ax = ax + self._apply_text_cross_attention(
+            apply_text_cross_attention_to_residual(
+                ax,
                 ax,
                 audio.context,
                 self.audio_attn2,
@@ -281,6 +294,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 audio.prompt_timestep,
                 audio.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
+                norm_eps=self.norm_eps,
             )
 
         # Audio - Video cross attention.
@@ -359,8 +373,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
-            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            vx_scaled = rms_norm(vx, eps=self.norm_eps)
+            vx_scaled.mul_(1 + vscale_mlp)
+            vx_scaled.add_(vshift_mlp)
+            self.ff.add_to_residual(vx, vx_scaled, gate=vgate_mlp)
 
             del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
 
@@ -368,8 +384,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
-            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            ax_scaled = rms_norm(ax, eps=self.norm_eps)
+            ax_scaled.mul_(1 + ascale_mlp)
+            ax_scaled.add_(ashift_mlp)
+            self.audio_ff.add_to_residual(ax, ax_scaled, gate=agate_mlp)
 
             del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
 
@@ -384,15 +402,62 @@ def apply_cross_attention_adaln(
     q_scale: torch.Tensor,
     q_gate: torch.Tensor,
     prompt_scale_shift_table: torch.Tensor,
-    prompt_timestep: torch.Tensor,
+    prompt_timestep: torch.Tensor | CompressedTimestep,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> torch.Tensor:
     batch_size = x.shape[0]
+    prompt_timestep = expand_timestep(prompt_timestep)
     shift_kv, scale_kv = (
         prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
-    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
-    return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+    attn_input = rms_norm(x, eps=norm_eps)
+    attn_input.mul_(1 + q_scale)
+    attn_input.add_(q_shift)
+    encoder_hidden_states = context * (1 + scale_kv)
+    encoder_hidden_states.add_(shift_kv)
+    out = attn(attn_input, context=encoder_hidden_states, mask=context_mask)
+    out.mul_(q_gate)
+    return out
+
+
+def apply_text_cross_attention_to_residual(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    context: torch.Tensor,
+    attn: AttentionCallable,
+    scale_shift_table: torch.Tensor,
+    prompt_scale_shift_table: torch.Tensor | None,
+    timestep: torch.Tensor | CompressedTimestep,
+    prompt_timestep: torch.Tensor | CompressedTimestep | None,
+    context_mask: torch.Tensor | None = None,
+    cross_attention_adaln: bool = False,
+    norm_eps: float = 1e-6,
+) -> None:
+    """Apply text cross-attention and add it into residual without a full output copy."""
+    if cross_attention_adaln:
+        shift_q, scale_q, gate = BasicAVTransformerBlock.get_ada_values(
+            None, scale_shift_table, x.shape[0], timestep, slice(6, 9)
+        )
+        batch_size = x.shape[0]
+        prompt_timestep = expand_timestep(prompt_timestep)
+        shift_kv, scale_kv = (
+            prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+            + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+        ).unbind(dim=2)
+        attn_input = rms_norm(x, eps=norm_eps)
+        attn_input.mul_(1 + scale_q)
+        attn_input.add_(shift_q)
+        encoder_hidden_states = context * (1 + scale_kv)
+        encoder_hidden_states.add_(shift_kv)
+        attn.add_to_residual(residual, attn_input, outer_gate=gate, context=encoder_hidden_states, mask=context_mask)
+        return
+
+    attn.add_to_residual(residual, rms_norm(x, eps=norm_eps), context=context, mask=context_mask)
+
+
+def expand_timestep(timestep: torch.Tensor | CompressedTimestep | None) -> torch.Tensor | None:
+    if isinstance(timestep, CompressedTimestep):
+        return timestep.expand()
+    return timestep

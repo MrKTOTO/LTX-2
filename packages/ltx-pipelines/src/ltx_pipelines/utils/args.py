@@ -287,6 +287,25 @@ def basic_arg_parser(
             "Defaults to --offload. Example: --prompt-encoder-offload disk"
         ),
     )
+    parser.add_argument(
+        "--stage-2-device",
+        type=str,
+        default=None,
+        help=(
+            "Optional compute device for the distilled Stage 2 refinement pass. "
+            "When set, Stage 1 can run on --device and Stage 2 on another GPU. "
+            "Example: --stage-2-device cuda:1"
+        ),
+    )
+    parser.add_argument(
+        "--model-parallel-block-devices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated devices for diffusion transformer blocks only. "
+            "This does not affect Gemma prompt encoding. Example: cuda:0,cuda:2"
+        ),
+    )
 
     parser.add_argument(
         "--max-batch-size",
@@ -606,5 +625,33 @@ def default_2_stage_distilled_arg_parser(params: PipelineParams = LTX_2_3_PARAMS
             "Path to the spatial upsampler model used to increase the resolution "
             "of the generated video in the latent space."
         ),
+    )
+    parser.add_argument(
+        "--disable-audio",
+        action="store_true",
+        help="Skip LTX audio latent generation and encode a silent/video-only MP4.",
+    )
+    parser.add_argument(
+        "--tiled-denoising",
+        action="store_true",
+        help="Run video denoising on overlapped latent tiles instead of one full token sequence.",
+    )
+    parser.add_argument(
+        "--tiled-latent-frames",
+        type=int,
+        default=16,
+        help="Maximum latent-frame tile size for tiled denoising. 16 latent frames is about 121 output frames.",
+    )
+    parser.add_argument(
+        "--tiled-latent-overlap",
+        type=int,
+        default=4,
+        help="Latent-frame overlap blended between neighboring denoising tiles.",
+    )
+    parser.add_argument(
+        "--tiled-devices",
+        type=str,
+        default=None,
+        help="Comma-separated CUDA devices for tiled denoising, e.g. cuda:0,cuda:1,cuda:2.",
     )
     return parser

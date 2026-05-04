@@ -70,6 +70,13 @@ def euler_denoising_loop(
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
         audio_state = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
+        del denoised_video, denoised_audio
+        if video_state is not None and video_state.latent.device.type == "cuda":
+            with torch.cuda.device(video_state.latent.device):
+                torch.cuda.empty_cache()
+        if audio_state is not None and audio_state.latent.device.type == "cuda":
+            with torch.cuda.device(audio_state.latent.device):
+                torch.cuda.empty_cache()
 
     return (video_state, audio_state)
 
