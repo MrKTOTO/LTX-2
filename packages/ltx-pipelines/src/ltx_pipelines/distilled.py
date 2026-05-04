@@ -46,8 +46,8 @@ from ltx_pipelines.utils.helpers import (
     post_process_latent,
 )
 from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.progress import progress
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,7 @@ class DistilledPipeline:
         prompt_encoder_staging_device: torch.device | None = None,
         stage_2_device: torch.device | None = None,
         model_parallel_block_devices: list[torch.device] | None = None,
+        decoder_devices: list[torch.device] | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
@@ -80,6 +81,7 @@ class DistilledPipeline:
         self.prompt_encoder_device = prompt_encoder_device or self.device
         self.stage_2_device = stage_2_device or self.device
         self.model_parallel_block_devices = model_parallel_block_devices
+        self.decoder_devices = decoder_devices or [self.device]
         self.dtype = torch.bfloat16
         prompt_offload_mode = prompt_encoder_offload_mode or offload_mode
         self.distilled_checkpoint_path = distilled_checkpoint_path
@@ -97,6 +99,10 @@ class DistilledPipeline:
             ",".join(str(device) for device in model_parallel_block_devices)
             if model_parallel_block_devices
             else self.device,
+        )
+        logger.info(
+            "[LTX distilled] Video decoder devices: %s",
+            ",".join(str(device) for device in self.decoder_devices),
         )
         logger.info("[LTX distilled] Prompt encoder staging device: %s", prompt_encoder_staging_device or "cpu")
         logger.info("[LTX distilled] Diffusion offload: %s", offload_mode.value)
@@ -127,7 +133,13 @@ class DistilledPipeline:
         self.upsampler = VideoUpsampler(
             distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
         )
-        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            decoder_devices=self.decoder_devices,
+        )
         self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
 
     def __call__(  # noqa: PLR0913
@@ -149,6 +161,9 @@ class DistilledPipeline:
         tiled_latent_frames: int = 16,
         tiled_latent_overlap: int = 4,
         tiled_devices: list[torch.device] | None = None,
+        stage_2_tiled_threshold_frames: int = 0,
+        stage_2_tiled_latent_frames: int = 64,
+        stage_2_tiled_latent_overlap: int = 16,
     ) -> tuple[Iterator[torch.Tensor], Audio | None]:
         assert_resolution(height=height, width=width, is_two_stage=True)
         started_at = time.monotonic()
@@ -278,6 +293,35 @@ class DistilledPipeline:
                 tiled_latent_overlap=tiled_latent_overlap,
                 tiled_devices=tiled_devices,
             )
+        elif (
+            not generate_audio
+            and stage_2_tiled_threshold_frames > 0
+            and num_frames > stage_2_tiled_threshold_frames
+        ):
+            logger.info(
+                "[LTX distilled] Stage 2-only tiled denoising enabled for %s frames "
+                "(threshold=%s, latent_tile=%s, overlap=%s)",
+                num_frames,
+                stage_2_tiled_threshold_frames,
+                stage_2_tiled_latent_frames,
+                stage_2_tiled_latent_overlap,
+            )
+            video_state, audio_state = self._run_tiled_video_stage(
+                stage=stage_2_stage,
+                sigmas=stage_2_sigmas,
+                noiser=stage_2_noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video_context=stage_2_video_context,
+                conditionings=stage_2_conditionings,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=stage_2_initial_latent,
+                tiled_latent_frames=stage_2_tiled_latent_frames,
+                tiled_latent_overlap=stage_2_tiled_latent_overlap,
+                tiled_devices=[stage_2_device],
+            )
         else:
             video_state, audio_state = stage_2_stage(
                 denoiser=SimpleDenoiser(stage_2_video_context, None),
@@ -386,12 +430,13 @@ class DistilledPipeline:
         pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
         latent_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
         video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), latent_shape, fps)
+        stage_device = getattr(stage, "_device", self.device)
         video_state = create_noised_state(
             tools=video_tools,
             conditionings=conditionings,
             noiser=noiser,
             dtype=self.dtype,
-            device=self.device,
+            device=stage_device,
             noise_scale=noise_scale,
             initial_latent=initial_latent,
         )
@@ -402,20 +447,20 @@ class DistilledPipeline:
         tiling = TileCountConfig(frames=frame_tiling)
         helper = VideoModalityTilingHelper(tiling, video_tools)
 
-        devices = tiled_devices or [self.device]
-        devices = [device for device in devices if device.type == "cuda" or device == self.device]
+        devices = tiled_devices or [stage_device]
+        devices = [device for device in devices if device.type == "cuda" or device == stage_device]
         if not devices:
-            devices = [self.device]
-        if self.device not in devices:
-            devices.insert(0, self.device)
+            devices = [stage_device]
+        if stage_device not in devices:
+            devices.insert(0, stage_device)
         if self.offload_mode == OffloadMode.DISK and len(devices) > 1:
             logger.warning(
                 "[LTX distilled] Multiple tiled devices are disabled with disk offload. "
                 "Windows/PyTorch can crash when several block-streaming contexts read the "
                 "same disk cache in one process; using %s for diffusion tiles.",
-                self.device,
+                stage_device,
             )
-            devices = [self.device]
+            devices = [stage_device]
 
         logger.info(
             "[LTX distilled] Tiled video denoising: latent=%s, tile_frames=%s, overlap=%s, tiles=%s, devices=%s",
@@ -426,14 +471,14 @@ class DistilledPipeline:
             ",".join(str(device) for device in devices),
         )
 
-        stages_by_device: dict[torch.device, DiffusionStage] = {self.device: stage}
+        stages_by_device: dict[torch.device, DiffusionStage] = {stage_device: stage}
         for device in devices:
-            if device != self.device:
+            if device != stage_device:
                 stages_by_device[device] = self._make_diffusion_stage(device)
 
         stepper = EulerDiffusionStep()
-        sigmas = sigmas.to(dtype=torch.float32, device=self.device)
-        output_device = self.device
+        sigmas = sigmas.to(dtype=torch.float32, device=stage_device)
+        output_device = stage_device
 
         def run_tile(transformer, tile_modality, device: torch.device) -> torch.Tensor:
             device_context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
@@ -447,7 +492,7 @@ class DistilledPipeline:
                 device: stack.enter_context(stages_by_device[device].model_context(video_tools=video_tools))
                 for device in devices
             }
-            for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+            for step_idx, _ in enumerate(progress(sigmas[:-1])):
                 full_modality = modality_from_latent_state(video_state, video_context, sigmas[step_idx])
                 blend_output = torch.zeros_like(video_state.latent)
                 tile_results = []
@@ -488,6 +533,9 @@ def main() -> None:
             for part in args.model_parallel_block_devices.split(",")
             if part.strip()
         ]
+    decoder_devices = None
+    if args.decoder_devices:
+        decoder_devices = [torch.device(part.strip()) for part in args.decoder_devices.split(",") if part.strip()]
     prompt_encoder_staging_device = (
         torch.device(args.prompt_encoder_staging_device) if args.prompt_encoder_staging_device else None
     )
@@ -504,6 +552,7 @@ def main() -> None:
         prompt_encoder_staging_device=prompt_encoder_staging_device,
         stage_2_device=stage_2_device,
         model_parallel_block_devices=model_parallel_block_devices,
+        decoder_devices=decoder_devices,
         quantization=args.quantization,
         torch_compile=args.compile,
         offload_mode=args.offload_mode,
@@ -528,6 +577,9 @@ def main() -> None:
         tiled_latent_frames=args.tiled_latent_frames,
         tiled_latent_overlap=args.tiled_latent_overlap,
         tiled_devices=tiled_devices,
+        stage_2_tiled_threshold_frames=args.stage_2_tiled_threshold_frames,
+        stage_2_tiled_latent_frames=args.stage_2_tiled_latent_frames,
+        stage_2_tiled_latent_overlap=args.stage_2_tiled_latent_overlap,
     )
 
     logger.info("[LTX distilled] Encoding output video to %s", args.output_path)

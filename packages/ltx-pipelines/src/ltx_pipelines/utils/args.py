@@ -306,6 +306,15 @@ def basic_arg_parser(
             "This does not affect Gemma prompt encoding. Example: cuda:0,cuda:2"
         ),
     )
+    parser.add_argument(
+        "--decoder-devices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated CUDA devices for parallel temporal VAE video decoding. "
+            "Frames are still yielded in order. Example: cuda:0,cuda:1"
+        ),
+    )
 
     parser.add_argument(
         "--max-batch-size",
@@ -653,5 +662,26 @@ def default_2_stage_distilled_arg_parser(params: PipelineParams = LTX_2_3_PARAMS
         type=str,
         default=None,
         help="Comma-separated CUDA devices for tiled denoising, e.g. cuda:0,cuda:1,cuda:2.",
+    )
+    parser.add_argument(
+        "--stage-2-tiled-threshold-frames",
+        type=int,
+        default=0,
+        help=(
+            "Automatically use temporal latent tiling for Stage 2 only when num-frames is above this value. "
+            "0 disables the automatic Stage 2 fallback."
+        ),
+    )
+    parser.add_argument(
+        "--stage-2-tiled-latent-frames",
+        type=int,
+        default=64,
+        help="Maximum latent-frame tile size for the automatic Stage 2-only fallback.",
+    )
+    parser.add_argument(
+        "--stage-2-tiled-latent-overlap",
+        type=int,
+        default=16,
+        help="Latent-frame overlap blended between neighboring Stage 2-only tiles.",
     )
     return parser

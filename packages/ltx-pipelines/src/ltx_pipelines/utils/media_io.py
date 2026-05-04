@@ -13,11 +13,11 @@ import torch
 from einops import rearrange
 from PIL import Image
 from torch._prims_common import DeviceLikeType
-from tqdm import tqdm
 
 from ltx_core.hdr import LogC3
 from ltx_core.types import Audio, VideoPixelShape
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
+from ltx_pipelines.utils.progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +353,7 @@ def encode_video(
         yield from tiles_generator
 
     logger.info("Encoding video chunks")
-    for chunk_index, video_chunk in enumerate(tqdm(all_tiles(first_chunk, video), total=video_chunks_number), start=1):
+    for chunk_index, video_chunk in enumerate(progress(all_tiles(first_chunk, video), total=video_chunks_number), start=1):
         logger.info("Encoding video chunk %s/%s", chunk_index, video_chunks_number)
         video_chunk_cpu = video_chunk.to("cpu").numpy()
         for frame_array in video_chunk_cpu:

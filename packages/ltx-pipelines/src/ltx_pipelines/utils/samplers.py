@@ -4,13 +4,13 @@ from functools import partial
 from typing import Callable
 
 import torch
-from tqdm import tqdm
 
 from ltx_core.components.diffusion_steps import Res2sDiffusionStep
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.model.transformer import X0Model
 from ltx_core.utils import to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import post_process_latent, timesteps_from_mask
+from ltx_pipelines.utils.progress import progress
 from ltx_pipelines.utils.res2s import get_res2s_coefficients
 from ltx_pipelines.utils.types import Denoiser, LatentState
 
@@ -65,7 +65,7 @@ def euler_denoising_loop(
     tuple[LatentState | None, LatentState | None]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    for step_idx, _ in enumerate(progress(sigmas[:-1])):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
@@ -116,7 +116,7 @@ def gradient_estimating_euler_denoising_loop(
             denoised_sample = to_denoised(noisy_sample, total_velocity, sigma)
         return current_velocity, denoised_sample
 
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    for step_idx, _ in enumerate(progress(sigmas[:-1])):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
         if video_state is not None and denoised_video is not None:
@@ -274,7 +274,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     phi_cache = {}
     c2 = 0.5  # Midpoint for res_2s
 
-    for step_idx in tqdm(range(n_full_steps)):
+    for step_idx in progress(range(n_full_steps)):
         sigma = sigmas[step_idx].double()
         sigma_next = sigmas[step_idx + 1].double()
 

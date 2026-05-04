@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
@@ -567,15 +568,43 @@ class VideoDecoder:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        decoder_devices: list[torch.device] | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
+        self._devices = self._unique_devices(decoder_devices or [device])
+        if device not in self._devices:
+            self._devices.insert(0, device)
         self._decoder_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=VideoDecoderConfigurator,
             model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
             registry=registry or DummyRegistry(),
         )
+
+    @staticmethod
+    def _unique_devices(devices: list[torch.device]) -> list[torch.device]:
+        unique: list[torch.device] = []
+        for device in devices:
+            if device not in unique:
+                unique.append(device)
+        return unique
+
+    @staticmethod
+    def _convert_decoded_frames(frames: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
+        video = frames[0].permute(1, 2, 3, 0).contiguous()
+        video.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
+        if output_dtype == torch.uint8:
+            return video.mul_(255.0).to(torch.uint8)
+        return video.to(output_dtype)
+
+    @staticmethod
+    def _copy_latent_to_device(latent: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if latent.device == device:
+            return latent
+        if latent.device.type == "cuda" and device.type == "cuda":
+            return latent.detach().to("cpu").to(device)
+        return latent.detach().to(device)
 
     def __call__(
         self,
@@ -591,8 +620,166 @@ class VideoDecoder:
                 (default) maps to ``[0, 255]``.  Any floating dtype returns
                 ``[0, 1]`` cast to that dtype.
         """
+        if len(self._devices) > 1 and tiling_config is not None and tiling_config.temporal_config is not None:
+            return self._parallel_tiled_decode(latent, tiling_config, generator, output_dtype=output_dtype)
+
         decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
         return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator, output_dtype=output_dtype), decoder)
+
+    def _parallel_tiled_decode(
+        self,
+        latent: torch.Tensor,
+        tiling_config: TilingConfig,
+        generator: torch.Generator | None = None,
+        *,
+        output_dtype: torch.dtype,
+    ) -> Iterator[torch.Tensor]:
+        """Decode temporal VAE chunks on multiple GPUs and yield chunks in order."""
+        devices = [device for device in self._devices if device.type == "cuda"]
+        if len(devices) <= 1:
+            decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+            return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator, output_dtype=output_dtype), decoder)
+
+        def iterator() -> Iterator[torch.Tensor]:
+            decoders = {
+                device: self._decoder_builder.build(device=device, dtype=self._dtype).to(device).eval()
+                for device in devices
+            }
+            latent_by_device = {
+                device: self._copy_latent_to_device(latent, device)
+                for device in devices
+            }
+            executor = ThreadPoolExecutor(max_workers=len(devices), thread_name_prefix="ltx-vae-decode")
+
+            try:
+                if any(getattr(decoder, "timestep_conditioning", False) for decoder in decoders.values()):
+                    logger.warning(
+                        "Parallel video decode disabled because this VAE decoder uses timestep-conditioned noise."
+                    )
+                    device = devices[0]
+                    yield from decoders[device].decode_video(
+                        latent_by_device[device],
+                        tiling_config,
+                        generator,
+                        output_dtype=output_dtype,
+                    )
+                    return
+
+                planner = decoders[devices[0]]
+                tiles = planner._prepare_tiles(latent_by_device[devices[0]], tiling_config)
+                temporal_groups = planner._group_tiles_by_temporal_slice(tiles)
+                logger.info(
+                    "Parallel video decode: temporal_groups=%s, devices=%s",
+                    len(temporal_groups),
+                    ",".join(str(device) for device in devices),
+                )
+
+                def decode_group(
+                    group_idx: int,
+                    group_tiles: list,
+                    device: torch.device,
+                ) -> tuple[int, slice, torch.Tensor, torch.Tensor]:
+                    with torch.inference_mode(), torch.cuda.device(device):
+                        decoder = decoders[device]
+                        device_latent = latent_by_device[device]
+                        curr_temporal_slice = group_tiles[0].out_coords[2]
+                        full_video_shape = VideoLatentShape.from_torch_shape(device_latent.shape).upscale(
+                            decoder.video_downscale_factors
+                        )
+                        temporal_tile_buffer_shape = full_video_shape._replace(
+                            frames=curr_temporal_slice.stop - curr_temporal_slice.start,
+                        )
+                        buffer = torch.zeros(
+                            temporal_tile_buffer_shape.to_torch_shape(),
+                            device=device,
+                            dtype=device_latent.dtype,
+                        )
+                        weights = decoder._accumulate_temporal_group_into_buffer(
+                            group_tiles=group_tiles,
+                            buffer=buffer,
+                            latent=device_latent,
+                            timestep=None,
+                            generator=None,
+                        )
+                        return (
+                            group_idx,
+                            curr_temporal_slice,
+                            buffer.detach().to("cpu"),
+                            weights.detach().to("cpu"),
+                        )
+
+                pending: dict[int, Future] = {}
+                next_submit = 0
+
+                def submit_next() -> None:
+                    nonlocal next_submit
+                    if next_submit >= len(temporal_groups):
+                        return
+                    device = devices[next_submit % len(devices)]
+                    pending[next_submit] = executor.submit(
+                        decode_group,
+                        next_submit,
+                        temporal_groups[next_submit],
+                        device,
+                    )
+                    next_submit += 1
+
+                for _ in range(min(len(devices), len(temporal_groups))):
+                    submit_next()
+
+                previous_chunk = None
+                previous_weights = None
+                previous_temporal_slice = None
+
+                for group_idx in range(len(temporal_groups)):
+                    decoded_idx, curr_temporal_slice, buffer, curr_weights = pending.pop(group_idx).result()
+                    if decoded_idx != group_idx:
+                        raise RuntimeError(f"Decoded group order mismatch: expected {group_idx}, got {decoded_idx}")
+                    submit_next()
+
+                    if previous_chunk is not None:
+                        if previous_temporal_slice.stop > curr_temporal_slice.start:
+                            overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
+                            temporal_overlap_slice = slice(
+                                curr_temporal_slice.start - previous_temporal_slice.start,
+                                None,
+                            )
+
+                            previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[
+                                :, :, slice(0, overlap_len), :, :
+                            ]
+                            previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[
+                                :, :, slice(0, overlap_len), :, :
+                            ]
+
+                            buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[
+                                :, :, temporal_overlap_slice, :, :
+                            ]
+                            curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[
+                                :, :, temporal_overlap_slice, :, :
+                            ]
+
+                        previous_weights = previous_weights.clamp(min=1e-8)
+                        yield_len = curr_temporal_slice.start - previous_temporal_slice.start
+                        yield self._convert_decoded_frames(
+                            (previous_chunk / previous_weights)[:, :, :yield_len, :, :],
+                            output_dtype,
+                        )
+
+                    previous_chunk = buffer
+                    previous_weights = curr_weights
+                    previous_temporal_slice = curr_temporal_slice
+
+                if previous_chunk is not None:
+                    previous_weights = previous_weights.clamp(min=1e-8)
+                    yield self._convert_decoded_frames(previous_chunk / previous_weights, output_dtype)
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+                del decoders, latent_by_device
+                for device in devices:
+                    cleanup_device_memory(device)
+
+        return iterator()
 
 
 # ---------------------------------------------------------------------------
