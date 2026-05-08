@@ -189,6 +189,11 @@ class DistilledPipeline:
         if video_context.device != self.device:
             logger.info("[LTX distilled] Moving prompt video context to %s", self.device)
             video_context = video_context.to(self.device)
+        
+        # Explicitly cleanup prompt encoder device after encoding to free GPU1 for Stage 1
+        from ltx_pipelines.utils.helpers import cleanup_device_memory
+        cleanup_device_memory(self.prompt_encoder_device)
+        logger.info("[LTX distilled] Cleaned up prompt encoder device %s", self.prompt_encoder_device)
 
         # Stage 1: Initial low resolution video generation
         logger.info("[LTX distilled] Stage 1 conditioning")
