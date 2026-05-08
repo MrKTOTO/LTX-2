@@ -80,6 +80,29 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
         self.caption_projection = caption_projection
         self.prompt_adaln = prompt_adaln
+        self._positional_embeddings_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @staticmethod
+    def _positional_embeddings_cache_key(
+        positions: torch.Tensor,
+        inner_dim: int,
+        max_pos: list[int],
+        use_middle_indices_grid: bool,
+        num_attention_heads: int,
+        x_dtype: torch.dtype,
+    ) -> tuple:
+        return (
+            positions.data_ptr(),
+            positions.device.type,
+            positions.device.index,
+            tuple(positions.shape),
+            tuple(positions.stride()),
+            inner_dim,
+            tuple(max_pos),
+            use_middle_indices_grid,
+            num_attention_heads,
+            x_dtype,
+        )
 
     def _prepare_timestep(
         self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
@@ -174,6 +197,18 @@ class TransformerArgsPreprocessor:
         x_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Prepare positional embeddings."""
+        cache_key = self._positional_embeddings_cache_key(
+            positions=positions,
+            inner_dim=inner_dim,
+            max_pos=max_pos,
+            use_middle_indices_grid=use_middle_indices_grid,
+            num_attention_heads=num_attention_heads,
+            x_dtype=x_dtype,
+        )
+        cached = self._positional_embeddings_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         original_device = positions.device
         scratch_device_name = os.environ.get("LTX_ROPE_SCRATCH_DEVICE", "").strip()
@@ -200,6 +235,7 @@ class TransformerArgsPreprocessor:
         )
         if scratch_device is not None:
             pe = tuple(self._move_rope_tensor(tensor, original_device) for tensor in pe)
+        self._positional_embeddings_cache[cache_key] = pe
         return pe
 
     @staticmethod
