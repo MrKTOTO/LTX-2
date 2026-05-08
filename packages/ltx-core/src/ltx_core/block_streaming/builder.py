@@ -56,9 +56,35 @@ def _block_device_map(devices: list[torch.device], block_count: int) -> list[tor
     if not devices:
         raise ValueError("At least one block streaming device is required")
     strategy = os.environ.get("LTX_STREAM_BLOCK_DEVICE_STRATEGY", "contiguous").strip().lower()
+    
     if strategy == "round_robin":
         return [devices[idx % len(devices)] for idx in range(block_count)]
+    
+    if strategy == "three_way_split" and len(devices) == 3:
+        # Equal distribution across 3 GPUs for pipeline parallelism
+        # GPU0: blocks 0-15, GPU1: blocks 16-31, GPU2: blocks 32-47
+        placement: list[torch.device] = []
+        blocks_per_gpu = block_count // 3
+        remainder = block_count % 3
+        
+        for idx in range(block_count):
+            if idx < blocks_per_gpu + (1 if remainder > 0 else 0):
+                device_idx = 0
+            elif idx < 2 * blocks_per_gpu + (1 if remainder > 1 else 0):
+                device_idx = 1
+            else:
+                device_idx = 2
+            placement.append(devices[device_idx])
+        
+        logger.info(
+            "[LTX block_streaming] three_way_split strategy: GPU0=%d blocks, GPU1=%d blocks, GPU2=%d blocks",
+            sum(1 for d in placement if d == devices[0]),
+            sum(1 for d in placement if d == devices[1]),
+            sum(1 for d in placement if d == devices[2]),
+        )
+        return placement
 
+    # Default: contiguous strategy
     placement: list[torch.device] = []
     for idx in range(block_count):
         device_idx = min(len(devices) - 1, idx * len(devices) // block_count)

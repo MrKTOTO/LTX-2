@@ -142,6 +142,246 @@ class DistilledPipeline:
         )
         self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
 
+    def run_stage_1_only(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list[ImageConditioningInput],
+        enhance_prompt: bool = False,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
+        max_batch_size: int = 1,
+        generate_audio: bool = False,
+        tiled_denoising: bool = False,
+        tiled_latent_frames: int = 16,
+        tiled_latent_overlap: int = 4,
+        tiled_devices: list[torch.device] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run only Stage 1 of the pipeline (low-res denoising).
+        
+        Returns:
+            Tuple of (video_latent, video_context) for Stage 2 processing
+        """
+        assert_resolution(height=height, width=width, is_two_stage=True)
+        logger.info(
+            "[LTX distilled] Stage 1 only: %sx%s, frames=%s, fps=%s",
+            width,
+            height,
+            num_frames,
+            frame_rate,
+        )
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        dtype = torch.bfloat16
+
+        logger.info("[LTX distilled] Encoding prompt")
+        (ctx_p,) = self.prompt_encoder(
+            [prompt],
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+        )
+        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        if video_context.device != self.device:
+            logger.info("[LTX distilled] Moving prompt video context to %s", self.device)
+            video_context = video_context.to(self.device)
+
+        # Stage 1: Initial low resolution video generation
+        logger.info("[LTX distilled] Stage 1 conditioning")
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
+        stage_1_w, stage_1_h = width // 2, height // 2
+        stage_1_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_1_h,
+                width=stage_1_w,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+
+        logger.info("[LTX distilled] Stage 1 denoising")
+        if tiled_denoising and not generate_audio:
+            video_state, audio_state = self._run_tiled_video_stage(
+                stage=self.stage,
+                sigmas=stage_1_sigmas,
+                noiser=noiser,
+                width=stage_1_w,
+                height=stage_1_h,
+                frames=num_frames,
+                fps=frame_rate,
+                video_context=video_context,
+                conditionings=stage_1_conditionings,
+                tiled_latent_frames=tiled_latent_frames,
+                tiled_latent_overlap=tiled_latent_overlap,
+                tiled_devices=tiled_devices,
+            )
+        else:
+            video_state, audio_state = self.stage(
+                denoiser=SimpleDenoiser(video_context, audio_context if generate_audio else None),
+                sigmas=stage_1_sigmas,
+                noiser=noiser,
+                width=stage_1_w,
+                height=stage_1_h,
+                frames=num_frames,
+                fps=frame_rate,
+                video=ModalitySpec(context=video_context, conditionings=stage_1_conditionings),
+                audio=ModalitySpec(context=audio_context) if generate_audio else None,
+                max_batch_size=max_batch_size,
+            )
+
+        return video_state.latent, video_context
+
+    def run_stage_2_only(
+        self,
+        stage_1_latent: torch.Tensor,
+        video_context: torch.Tensor,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list[ImageConditioningInput],
+        tiling_config: TilingConfig | None = None,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
+        max_batch_size: int = 1,
+        generate_audio: bool = False,
+        tiled_denoising: bool = False,
+        tiled_latent_frames: int = 16,
+        tiled_latent_overlap: int = 4,
+        tiled_devices: list[torch.device] | None = None,
+        stage_2_tiled_threshold_frames: int = 0,
+        stage_2_tiled_latent_frames: int = 64,
+        stage_2_tiled_latent_overlap: int = 16,
+    ) -> Iterator[torch.Tensor]:
+        """
+        Run only Stage 2 of the pipeline (upsampling + high-res denoising + decode).
+        
+        Args:
+            stage_1_latent: Output latent from Stage 1
+            video_context: Video context from prompt encoding
+            
+        Returns:
+            Iterator of decoded video frames
+        """
+        logger.info(
+            "[LTX distilled] Stage 2 only: %sx%s, frames=%s",
+            width,
+            height,
+            num_frames,
+        )
+
+        dtype = torch.bfloat16
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        # Stage 2: Upsample and refine
+        logger.info("[LTX distilled] Stage 2 latent upsampling")
+        upscaled_video_latent = self.upsampler(stage_1_latent[:1])
+        del stage_1_latent
+        self._empty_cuda_cache(self.device, self.stage_2_device)
+
+        logger.info("[LTX distilled] Stage 2 conditioning")
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
+        stage_2_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        stage_2_device = self.stage_2_device
+        stage_2_stage = self.stage if stage_2_device == self.device else self._make_diffusion_stage(stage_2_device)
+        stage_2_noiser = GaussianNoiser(torch.Generator(device=stage_2_device).manual_seed(seed + 1))
+        stage_2_video_context = video_context
+        stage_2_initial_latent = upscaled_video_latent
+        
+        if stage_2_device != self.device:
+            logger.info("[LTX distilled] Moving Stage 2 denoising tensors to %s", stage_2_device)
+            stage_2_sigmas = stage_2_sigmas.to(stage_2_device)
+            stage_2_video_context = video_context.to(stage_2_device)
+            stage_2_initial_latent = upscaled_video_latent.to(stage_2_device)
+            stage_2_conditionings = self._move_conditionings(stage_2_conditionings, stage_2_device)
+            del upscaled_video_latent
+            self._empty_cuda_cache(self.device, stage_2_device)
+
+        logger.info("[LTX distilled] Stage 2 denoising")
+        if tiled_denoising and not generate_audio:
+            video_state, audio_state = self._run_tiled_video_stage(
+                stage=stage_2_stage,
+                sigmas=stage_2_sigmas,
+                noiser=stage_2_noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video_context=stage_2_video_context,
+                conditionings=stage_2_conditionings,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=stage_2_initial_latent,
+                tiled_latent_frames=tiled_latent_frames,
+                tiled_latent_overlap=tiled_latent_overlap,
+                tiled_devices=tiled_devices,
+            )
+        elif (
+            not generate_audio
+            and stage_2_tiled_threshold_frames > 0
+            and num_frames > stage_2_tiled_threshold_frames
+        ):
+            logger.info(
+                "[LTX distilled] Stage 2-only tiled denoising enabled for %s frames",
+                num_frames,
+            )
+            video_state, audio_state = self._run_tiled_video_stage(
+                stage=stage_2_stage,
+                sigmas=stage_2_sigmas,
+                noiser=stage_2_noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video_context=stage_2_video_context,
+                conditionings=stage_2_conditionings,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=stage_2_initial_latent,
+                tiled_latent_frames=stage_2_tiled_latent_frames,
+                tiled_latent_overlap=stage_2_tiled_latent_overlap,
+                tiled_devices=[stage_2_device],
+            )
+        else:
+            video_state, audio_state = stage_2_stage(
+                denoiser=SimpleDenoiser(stage_2_video_context, None),
+                sigmas=stage_2_sigmas,
+                noiser=stage_2_noiser,
+                width=width,
+                height=height,
+                frames=num_frames,
+                fps=frame_rate,
+                video=ModalitySpec(
+                    context=stage_2_video_context,
+                    conditionings=stage_2_conditionings,
+                    noise_scale=stage_2_sigmas[0].item(),
+                    initial_latent=stage_2_initial_latent,
+                ),
+                audio=None,
+                max_batch_size=max_batch_size,
+            )
+        
+        if video_state is not None and video_state.latent.device != self.device:
+            logger.info("[LTX distilled] Moving Stage 2 video latent back to %s for decoding", self.device)
+            video_state = replace(video_state, latent=video_state.latent.to(self.device))
+
+        logger.info("[LTX distilled] Creating video decoder iterator")
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+        return decoded_video
+
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
