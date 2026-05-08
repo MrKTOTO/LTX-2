@@ -197,6 +197,7 @@ class WeightsProvider:
         self._events.clear()
         self._ready_events.clear()
         self._in_use.clear()
+        self._pool.cleanup()
         if self._owns_source:
             self._source.cleanup()
         if self._owns_lora_sources:

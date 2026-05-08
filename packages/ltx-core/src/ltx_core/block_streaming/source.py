@@ -124,6 +124,7 @@ class DiskWeightSource(WeightSource):
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._cache.clear()
         self._events.clear()
+        self._pool.cleanup()
         self._reader.cleanup()
 
     def __len__(self) -> int:

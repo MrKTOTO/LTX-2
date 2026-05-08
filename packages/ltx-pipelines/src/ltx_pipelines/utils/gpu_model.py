@@ -1,12 +1,37 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
+import gc
+import logging
 from typing import TypeVar
 
 import torch
 
-from ltx_pipelines.utils.helpers import cleanup_memory
-
 _M = TypeVar("_M", bound=torch.nn.Module)
+logger = logging.getLogger(__name__)
+
+
+def _model_cuda_devices(model: torch.nn.Module) -> list[torch.device]:
+    devices: list[torch.device] = []
+    for tensor in (*tuple(model.parameters()), *tuple(model.buffers())):
+        device = tensor.device
+        if device.type == "cuda" and device not in devices:
+            devices.append(device)
+    return devices
+
+
+def _cleanup_devices(devices: list[torch.device]) -> None:
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    for device in devices:
+        with torch.cuda.device(device):
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+    try:
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
+    except Exception:
+        logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
 
 @contextmanager
@@ -23,8 +48,9 @@ def gpu_model(model: _M) -> Iterator[_M]:
     try:
         yield model
     finally:
-        torch.cuda.synchronize()
+        devices = _model_cuda_devices(model)
+        _cleanup_devices(devices)
         # .to("meta") releases storage for all parameters/buffers regardless
         # of their original device (CUDA or CPU).
         model.to("meta")
-        cleanup_memory()
+        _cleanup_devices(devices)

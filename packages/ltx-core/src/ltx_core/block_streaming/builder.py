@@ -52,6 +52,16 @@ def _unique_devices(devices: list[torch.device]) -> list[torch.device]:
     return unique
 
 
+def _layout_nbytes(layout: BlockLayout) -> int:
+    total = 0
+    for shape, dtype in layout.values():
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        total += numel * torch.empty((), dtype=dtype).element_size()
+    return total
+
+
 def _block_device_map(devices: list[torch.device], block_count: int) -> list[torch.device]:
     if not devices:
         raise ValueError("At least one block streaming device is required")
@@ -163,6 +173,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         dtype: torch.dtype,
         cpu_slots_count: int | None = None,
         gpu_slots_count: int | None = None,
+        prefetch_blocks_count: int | None = None,
         staging_device: torch.device | None = None,
         block_devices: list[torch.device] | None = None,
         **_kwargs: object,
@@ -218,7 +229,28 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 ",".join(str(device) for device in provider_devices),
             )
         providers: dict[torch.device, WeightsProvider] = {}
-        prefetch_blocks = _env_int("LTX_STREAM_PREFETCH_BLOCKS", 0, minimum=0)
+        prefetch_blocks = (
+            max(0, int(prefetch_blocks_count))
+            if prefetch_blocks_count is not None
+            else _env_int("LTX_STREAM_PREFETCH_BLOCKS", 0, minimum=0)
+        )
+        layout_gib = _layout_nbytes(layout) / (1024**3)
+        source_kind = "pinned-all-blocks" if cpu_slots_count >= len(blocks) else "disk-streaming"
+        logger.info(
+            "[LTX block_streaming] target=%s, blocks=%d, block_buffer=%.2f GiB, "
+            "source=%s, cpu_slots=%d (%.2f GiB), gpu_slots=%d x %d provider(s) (%.2f GiB), "
+            "prefetch_blocks=%d",
+            target_device,
+            len(blocks),
+            layout_gib,
+            source_kind,
+            cpu_slots_count,
+            layout_gib * cpu_slots_count,
+            gpu_slots_count,
+            len(provider_devices),
+            layout_gib * gpu_slots_count * len(provider_devices),
+            prefetch_blocks,
+        )
         for device in provider_devices:
             copy_stream = torch.cuda.Stream(device=device)
             gpu_pool = WeightPool(

@@ -66,3 +66,8 @@ class WeightPool:
         if event is not None:
             self._events[id(weights)] = event
         self._free.append(weights)
+
+    def cleanup(self) -> None:
+        """Drop all pooled tensors so CUDA/pinned memory can be reclaimed."""
+        self._free.clear()
+        self._events.clear()

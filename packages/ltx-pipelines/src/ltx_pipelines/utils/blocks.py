@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import logging
 import os
+import gc
+import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from typing import Callable, TypeVar
-import os
 
 import torch
 
@@ -56,7 +58,7 @@ from ltx_core.model.video_vae import (
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import (
     EMBEDDINGS_PROCESSOR_KEY_OPS,
-    GEMMA_LLM_KEY_OPS,
+    GEMMA_LLM_ENCODE_KEY_OPS,
     GEMMA_MODEL_OPS,
     EmbeddingsProcessorConfigurator,
     GemmaTextEncoderConfigurator,
@@ -69,9 +71,7 @@ from ltx_core.utils import find_matching_file
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_device_memory,
-    cleanup_memory,
     create_noised_state,
-    generate_enhanced_prompt,
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.types import Denoiser, ModalitySpec, OffloadMode
@@ -80,11 +80,57 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _M = TypeVar("_M", bound=torch.nn.Module)
+_PROMPT_ENCODER_SEMAPHORE_LOCK = threading.Lock()
+_PROMPT_ENCODER_SEMAPHORE: tuple[int, threading.BoundedSemaphore] | None = None
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def _prompt_encoder_semaphore() -> tuple[int, threading.BoundedSemaphore]:
+    global _PROMPT_ENCODER_SEMAPHORE
+    limit = _env_int("LTX_TEXT_ENCODER_PARALLELISM", 1, minimum=1)
+    with _PROMPT_ENCODER_SEMAPHORE_LOCK:
+        if _PROMPT_ENCODER_SEMAPHORE is None or _PROMPT_ENCODER_SEMAPHORE[0] != limit:
+            _PROMPT_ENCODER_SEMAPHORE = (limit, threading.BoundedSemaphore(limit))
+        return _PROMPT_ENCODER_SEMAPHORE
+
+
+@contextmanager
+def _prompt_encoder_slot(device: torch.device) -> Iterator[None]:
+    limit, semaphore = _prompt_encoder_semaphore()
+    logger.info("Prompt encoder concurrency: waiting for slot on %s (limit=%d)", device, limit)
+    semaphore.acquire()
+    try:
+        logger.info("Prompt encoder concurrency: acquired slot on %s", device)
+        yield
+    finally:
+        semaphore.release()
+
+
+def _cleanup_cuda_devices(devices: list[torch.device]) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        seen: set[torch.device] = set()
+        for device in devices:
+            if device.type != "cuda" or device in seen:
+                continue
+            seen.add(device)
+            cleanup_device_memory(device)
+    try:
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
+    except Exception:
+        logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
 
 @contextmanager
@@ -95,14 +141,26 @@ def _streaming_model(
     dtype: torch.dtype,
     staging_device: torch.device | None = None,
     block_devices: list[torch.device] | None = None,
+    cpu_slots_override: int | None = None,
+    gpu_slots_override: int | None = None,
+    prefetch_blocks_override: int | None = None,
 ) -> Iterator:
     """Build a streaming wrapper, yield it, then tear down and free memory."""
-    disk_cpu_slots = int(os.environ.get("LTX_STREAM_CPU_SLOTS", DISK_CPU_SLOTS))
-    cpu_slots_count = max(2, disk_cpu_slots) if offload_mode == OffloadMode.DISK else None
+    disk_cpu_slots = (
+        max(1, int(cpu_slots_override))
+        if cpu_slots_override is not None
+        else _env_int("LTX_STREAM_CPU_SLOTS", DISK_CPU_SLOTS, minimum=1)
+    )
+    if offload_mode == OffloadMode.DISK:
+        cpu_slots_count = disk_cpu_slots if cpu_slots_override is not None else max(2, disk_cpu_slots)
+    else:
+        cpu_slots_count = None
     wrapped = builder.build(
         target_device=target_device,
         dtype=dtype,
         cpu_slots_count=cpu_slots_count,
+        gpu_slots_count=gpu_slots_override,
+        prefetch_blocks_count=prefetch_blocks_override,
         staging_device=staging_device,
         block_devices=block_devices,
     )
@@ -111,7 +169,8 @@ def _streaming_model(
     finally:
         wrapped.teardown()
         wrapped.to("meta")
-        cleanup_memory()
+        cleanup_devices = [target_device, *(block_devices or [])]
+        _cleanup_cuda_devices(cleanup_devices)
 
 
 def _build_state(
@@ -395,14 +454,14 @@ class PromptEncoder:
         self._text_encoder_builder = Builder(
             model_path=tuple(weight_paths),
             model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
+            model_sd_ops=GEMMA_LLM_ENCODE_KEY_OPS,
             module_ops=(GEMMA_MODEL_OPS, *module_ops),
             registry=registry or DummyRegistry(),
         )
         self._streaming_text_encoder_builder = StreamingModelBuilder(
             model_path=tuple(weight_paths),
             model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
+            model_sd_ops=GEMMA_LLM_ENCODE_KEY_OPS,
             module_ops=(GEMMA_MODEL_OPS, *module_ops),
             registry=registry or DummyRegistry(),
             blocks_attr="model.model.language_model.layers",
@@ -417,13 +476,36 @@ class PromptEncoder:
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            return _streaming_model(
-                self._streaming_text_encoder_builder,
-                self._offload_mode,
-                self._device,
-                self._dtype,
-                staging_device=self._text_encoder_staging_device,
-            )
+            @contextmanager
+            def prompt_encoder_streaming_ctx() -> Iterator:
+                # Gemma needs a much smaller streaming window than diffusion on
+                # 8 GB cards. Pass the values directly to the builder instead
+                # of mutating process-wide os.environ: scene workers run in
+                # parallel threads, so global env overrides can leak into a
+                # neighboring diffusion build.
+                cpu_slots = _env_int("LTX_TEXT_ENCODER_STREAM_CPU_SLOTS", 2, minimum=1)
+                gpu_slots = _env_int("LTX_TEXT_ENCODER_STREAM_GPU_SLOTS", 1, minimum=1)
+                prefetch_blocks = _env_int("LTX_TEXT_ENCODER_STREAM_PREFETCH_BLOCKS", 0, minimum=0)
+                logger.info(
+                    "Prompt encoder streaming: cpu_slots=%s, gpu_slots=%s, prefetch_blocks=%s",
+                    cpu_slots,
+                    gpu_slots,
+                    prefetch_blocks,
+                )
+                with _prompt_encoder_slot(self._device):
+                    with _streaming_model(
+                        self._streaming_text_encoder_builder,
+                        self._offload_mode,
+                        self._device,
+                        self._dtype,
+                        staging_device=self._text_encoder_staging_device,
+                        cpu_slots_override=cpu_slots,
+                        gpu_slots_override=gpu_slots,
+                        prefetch_blocks_override=prefetch_blocks,
+                    ) as model:
+                        yield model
+
+            return prompt_encoder_streaming_ctx()
         return gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval())
 
     def _move_raw_outputs(
@@ -455,24 +537,24 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
-        with self._text_encoder_ctx() as text_encoder:
+        with torch.no_grad():
             if enhance_first_prompt:
-                prompts = list(prompts)
-                prompts[0] = generate_enhanced_prompt(
-                    text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
+                raise NotImplementedError(
+                    "Prompt enhancement requires Gemma lm_head, which is disabled in the low-VRAM encode-only path."
                 )
-            raw_outputs = [text_encoder.encode(p) for p in prompts]
+            with self._text_encoder_ctx() as text_encoder:
+                raw_outputs = [text_encoder.encode(p) for p in prompts]
 
-        raw_outputs = self._move_raw_outputs(raw_outputs)
-        with gpu_model(
-            self._embeddings_processor_builder.build(
-                device=self._embeddings_processor_device,
-                dtype=self._dtype,
-            )
-            .to(self._embeddings_processor_device)
-            .eval()
-        ) as embeddings_processor:
-            return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+            raw_outputs = self._move_raw_outputs(raw_outputs)
+            with gpu_model(
+                self._embeddings_processor_builder.build(
+                    device=self._embeddings_processor_device,
+                    dtype=self._dtype,
+                )
+                .to(self._embeddings_processor_device)
+                .eval()
+            ) as embeddings_processor:
+                return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
 
 
 # ---------------------------------------------------------------------------
@@ -506,8 +588,13 @@ class ImageConditioner:
 
     def __call__(self, fn: Callable[[VideoEncoder], T]) -> T:
         """Build video encoder → call *fn(encoder)* → free encoder."""
+        started_at = time.monotonic()
+        logger.info("Image conditioner: building video encoder on %s", self._device)
         with gpu_model(self._build_encoder()) as encoder:
-            return fn(encoder)
+            logger.info("Image conditioner: video encoder ready in %.1fs", time.monotonic() - started_at)
+            result = fn(encoder)
+            logger.info("Image conditioner: conditioning callback complete in %.1fs", time.monotonic() - started_at)
+            return result
 
 
 # ---------------------------------------------------------------------------

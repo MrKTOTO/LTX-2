@@ -68,6 +68,7 @@ class DistilledPipeline:
         device: torch.device | None = None,
         prompt_encoder_device: torch.device | None = None,
         prompt_encoder_staging_device: torch.device | None = None,
+        prompt_embeddings_processor_device: torch.device | None = None,
         stage_2_device: torch.device | None = None,
         model_parallel_block_devices: list[torch.device] | None = None,
         decoder_devices: list[torch.device] | None = None,
@@ -84,6 +85,7 @@ class DistilledPipeline:
         self.decoder_devices = decoder_devices or [self.device]
         self.dtype = torch.bfloat16
         prompt_offload_mode = prompt_encoder_offload_mode or offload_mode
+        self.prompt_embeddings_processor_device = prompt_embeddings_processor_device or self.device
         self.distilled_checkpoint_path = distilled_checkpoint_path
         self.loras = tuple(loras)
         self.quantization = quantization
@@ -94,6 +96,7 @@ class DistilledPipeline:
         logger.info("[LTX distilled] Primary device: %s", self.device)
         logger.info("[LTX distilled] Prompt encoder device: %s", self.prompt_encoder_device)
         logger.info("[LTX distilled] Stage 2 device: %s", self.stage_2_device)
+        logger.info("[LTX distilled] Prompt embeddings processor device: %s", self.prompt_embeddings_processor_device)
         logger.info(
             "[LTX distilled] Diffusion block devices: %s",
             ",".join(str(device) for device in model_parallel_block_devices)
@@ -113,7 +116,7 @@ class DistilledPipeline:
             gemma_root,
             self.dtype,
             self.prompt_encoder_device,
-            embeddings_processor_device=self.device,
+            embeddings_processor_device=self.prompt_embeddings_processor_device,
             registry=registry,
             offload_mode=prompt_offload_mode,
             text_encoder_staging_device=prompt_encoder_staging_device,
@@ -180,11 +183,13 @@ class DistilledPipeline:
         dtype = torch.bfloat16
 
         logger.info("[LTX distilled] Encoding prompt")
+        prompt_started_at = time.monotonic()
         (ctx_p,) = self.prompt_encoder(
             [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
+        logger.info("[LTX distilled] Prompt encoding complete in %.1fs", time.monotonic() - prompt_started_at)
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
         if video_context.device != self.device:
             logger.info("[LTX distilled] Moving prompt video context to %s", self.device)
@@ -197,6 +202,7 @@ class DistilledPipeline:
 
         # Stage 1: Initial low resolution video generation
         logger.info("[LTX distilled] Stage 1 conditioning")
+        conditioning_started_at = time.monotonic()
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
         stage_1_w, stage_1_h = width // 2, height // 2
         stage_1_conditionings = self.image_conditioner(
@@ -209,6 +215,7 @@ class DistilledPipeline:
                 device=self.device,
             )
         )
+        logger.info("[LTX distilled] Stage 1 conditioning complete in %.1fs", time.monotonic() - conditioning_started_at)
 
         logger.info("[LTX distilled] Stage 1 denoising")
         if tiled_denoising and not generate_audio:
@@ -426,11 +433,13 @@ class DistilledPipeline:
         dtype = torch.bfloat16
 
         logger.info("[LTX distilled] Encoding prompt")
+        prompt_started_at = time.monotonic()
         (ctx_p,) = self.prompt_encoder(
             [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
+        logger.info("[LTX distilled] Prompt encoding complete in %.1fs", time.monotonic() - prompt_started_at)
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
         if video_context.device != self.device:
             logger.info("[LTX distilled] Moving prompt video context to %s", self.device)
@@ -444,6 +453,7 @@ class DistilledPipeline:
 
         # Stage 1: Initial low resolution video generation.
         logger.info("[LTX distilled] Stage 1 conditioning")
+        conditioning_started_at = time.monotonic()
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
         stage_1_w, stage_1_h = width // 2, height // 2
         stage_1_conditionings = self.image_conditioner(
@@ -456,6 +466,7 @@ class DistilledPipeline:
                 device=self.device,
             )
         )
+        logger.info("[LTX distilled] Stage 1 conditioning complete in %.1fs", time.monotonic() - conditioning_started_at)
 
         logger.info("[LTX distilled] Stage 1 denoising")
         if tiled_denoising and not generate_audio:

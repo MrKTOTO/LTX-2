@@ -121,6 +121,17 @@ GEMMA_LLM_KEY_OPS = (
     )
 )
 
+GEMMA_LLM_ENCODE_KEY_OPS = (
+    SDOps("GEMMA_LLM_ENCODE_KEY_OPS")
+    # Encode-only prompt conditioning only needs streamed language layers
+    # and the final norm. The huge token embedding matrix is read row-wise
+    # from safetensors at runtime and passed as inputs_embeds; vision tower,
+    # projector, and lm_head are not touched for text-only encoding.
+    .with_matching(prefix="language_model.model.layers.")
+    .with_matching(prefix="language_model.model.norm.")
+    .with_replacement("language_model.model.", "model.model.language_model.")
+)
+
 EMBEDDINGS_PROCESSOR_KEY_OPS = (
     SDOps("EMBEDDINGS_PROCESSOR_KEY_OPS")
     # 1. Map the feature extractor (V1: aggregate_embed inside feature_extractor)

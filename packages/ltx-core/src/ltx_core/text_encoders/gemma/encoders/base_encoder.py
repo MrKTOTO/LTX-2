@@ -1,6 +1,7 @@
 import functools
 from pathlib import Path
 
+import safetensors
 import torch
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
@@ -21,12 +22,14 @@ class GemmaTextEncoder(torch.nn.Module):
         tokenizer: LTXVGemmaTokenizer | None = None,
         processor: Gemma3Processor | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        embedding_weight_path: str | None = None,
     ):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
         self.processor = processor
         self._dtype = dtype
+        self.embedding_weight_path = embedding_weight_path
 
     def encode(
         self,
@@ -39,12 +42,39 @@ class GemmaTextEncoder(torch.nn.Module):
             (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
         """
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
-        outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        token_ids = [int(t[0]) for t in token_pairs]
+        device = self._language_model_device()
+        attention_mask = torch.tensor([[int(w[1]) for w in token_pairs]], device=device)
+        if self.embedding_weight_path:
+            inputs_embeds = self._load_inputs_embeds(token_ids, device)
+            outputs = self.model.model.language_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+        else:
+            input_ids = torch.tensor([token_ids], device=device)
+            outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
         return hidden_states, attention_mask
+
+    def _language_model_device(self) -> torch.device:
+        norm = self.model.model.language_model.norm
+        for tensor in (*tuple(norm.parameters(recurse=False)), *tuple(norm.buffers(recurse=False))):
+            if tensor.device.type != "meta":
+                return tensor.device
+        for tensor in self.model.model.language_model.parameters():
+            if tensor.device.type != "meta":
+                return tensor.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _load_inputs_embeds(self, token_ids: list[int], device: torch.device) -> torch.Tensor:
+        with safetensors.safe_open(self.embedding_weight_path, framework="pt", device="cpu") as handle:
+            rows = handle.get_slice("language_model.model.embed_tokens.weight")[token_ids, :]
+        inputs_embeds = rows.unsqueeze(0).to(device=device, dtype=self._dtype)
+        embed_scale = self.model.model.language_model.embed_tokens.embed_scale
+        return inputs_embeds * embed_scale.to(device=device, dtype=inputs_embeds.dtype)
 
     # --- Prompt enhancement methods ---
 
@@ -177,9 +207,11 @@ def _pad_inputs_for_attention_alignment(
 def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
     tokenizer_root = str(find_matching_file(gemma_root, "tokenizer.model").parent)
     processor_root = str(find_matching_file(gemma_root, "preprocessor_config.json").parent)
+    embedding_weight_path = _find_embedding_weight_path(gemma_root)
 
     def load_tokenizer(module: GemmaTextEncoder) -> GemmaTextEncoder:
         module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, 1024)
+        module.embedding_weight_path = embedding_weight_path
         return module
 
     def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:
@@ -200,3 +232,11 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         mutator=load_processor,
     )
     return (tokenizer_load_ops, processor_load_ops)
+
+
+def _find_embedding_weight_path(gemma_root: str) -> str:
+    for path in sorted(Path(gemma_root).rglob("*.safetensors")):
+        with safetensors.safe_open(str(path), framework="pt", device="cpu") as handle:
+            if "language_model.model.embed_tokens.weight" in handle.keys():
+                return str(path)
+    raise FileNotFoundError(f"Gemma embedding weights not found under {gemma_root}")
