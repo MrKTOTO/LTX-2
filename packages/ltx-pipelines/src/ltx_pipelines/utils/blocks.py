@@ -417,26 +417,13 @@ class PromptEncoder:
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            @contextmanager
-            def _prompt_streaming_model() -> Iterator:
-                previous_gpu_slots = os.environ.get("LTX_STREAM_GPU_SLOTS")
-                os.environ["LTX_STREAM_GPU_SLOTS"] = os.environ.get("LTX_PROMPT_ENCODER_GPU_SLOTS", "1")
-                try:
-                    with _streaming_model(
-                        self._streaming_text_encoder_builder,
-                        self._offload_mode,
-                        self._device,
-                        self._dtype,
-                        staging_device=self._text_encoder_staging_device,
-                    ) as wrapped:
-                        yield wrapped
-                finally:
-                    if previous_gpu_slots is None:
-                        os.environ.pop("LTX_STREAM_GPU_SLOTS", None)
-                    else:
-                        os.environ["LTX_STREAM_GPU_SLOTS"] = previous_gpu_slots
-
-            return _prompt_streaming_model()
+            return _streaming_model(
+                self._streaming_text_encoder_builder,
+                self._offload_mode,
+                self._device,
+                self._dtype,
+                staging_device=self._text_encoder_staging_device,
+            )
         return gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval())
 
     def _move_raw_outputs(
