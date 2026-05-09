@@ -150,3 +150,31 @@ class PinnedWeightSource(WeightSource):
 
     def __len__(self) -> int:
         return len(self._weights)
+
+
+class RamWeightSource(WeightSource):
+    """Pre-loaded CPU weights kept in regular pageable RAM.
+
+    This avoids registering tens of GB of host memory with CUDA, which can fail
+    on Windows / consumer GPUs long before ordinary system RAM is exhausted.
+    H2D copies may be less asynchronous than fully pinned memory, but the model
+    still stays off disk after the initial checkpoint load.
+    """
+
+    def __init__(self, weights: dict[int, dict[str, torch.Tensor]]) -> None:
+        self._weights = weights
+
+    def get(self, idx: int) -> dict[str, torch.Tensor]:
+        return self._weights[idx]
+
+    def release(self, idx: int, event: torch.cuda.Event) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        self._weights.clear()
+
+    def prefetch(self, idx: int, min_keep_idx: int | None = None) -> None:
+        pass
+
+    def __len__(self) -> int:
+        return len(self._weights)

@@ -14,7 +14,7 @@ from torch import nn
 from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource, block_cache_namespace
 from ltx_core.block_streaming.pool import BlockLayout, WeightPool
 from ltx_core.block_streaming.provider import WeightsProvider
-from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, WeightSource
+from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, RamWeightSource, WeightSource
 from ltx_core.block_streaming.utils import build_pool_layout, resolve_attr
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
 from ltx_core.loader.fuse_loras import apply_loras
@@ -42,6 +42,27 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(os.environ.get(name, default)))
     except ValueError:
         return default
+
+
+def _log_cuda_memory(device: torch.device, label: str) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        with torch.cuda.device(device):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            allocated_bytes = torch.cuda.memory_allocated(device)
+            reserved_bytes = torch.cuda.memory_reserved(device)
+        logger.info(
+            "%s | device=%s free=%.2fGB total=%.2fGB allocated=%.2fGB reserved=%.2fGB",
+            label,
+            device,
+            free_bytes / 1024**3,
+            total_bytes / 1024**3,
+            allocated_bytes / 1024**3,
+            reserved_bytes / 1024**3,
+        )
+    except Exception:
+        logger.debug("Failed to query CUDA memory for %s", device, exc_info=True)
 
 
 def _unique_devices(devices: list[torch.device]) -> list[torch.device]:
@@ -256,6 +277,18 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         non_block_sd: dict[str, torch.Tensor] = {}
         block_tensors: dict[int, dict[str, torch.Tensor]] = {}
         prefix_dot = self.blocks_prefix + "."
+        non_block_load_batch = _env_int("LTX_NON_BLOCK_LOAD_BATCH", 1 if target_device.type == "cuda" else 64)
+
+        cpu_stream_mode = os.environ.get("LTX_CPU_STREAM_MODE", "ram").strip().lower()
+        use_pinned_blocks = cpu_stream_mode == "pinned"
+
+        logger.info(
+            "Building %s CPU streaming source on %s with %s checkpoint tensors",
+            "pinned" if use_pinned_blocks else "pageable",
+            target_device,
+            len(model_sd.sd),
+        )
+        _log_cuda_memory(target_device, "Before partitioning pinned streaming source")
 
         for key, tensor in model_sd.sd.items():
             if key.startswith(prefix_dot):
@@ -264,22 +297,56 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 try:
                     block_idx = int(idx_str)
                 except ValueError:
-                    non_block_sd[self.state_dict_prefix + key] = tensor.to(device=target_device, dtype=dtype)
+                    non_block_sd[self.state_dict_prefix + key] = tensor
                     continue
                 block_tensors.setdefault(block_idx, {})[param_name] = tensor
             else:
-                non_block_sd[self.state_dict_prefix + key] = tensor.to(device=target_device, dtype=dtype)
+                non_block_sd[self.state_dict_prefix + key] = tensor
 
-        meta_model.load_state_dict(non_block_sd, strict=False, assign=True)
+        logger.info(
+            "Pinned CPU source partitioned: non_block_tensors=%s block_count=%s non_block_load_batch=%s",
+            len(non_block_sd),
+            len(block_tensors),
+            non_block_load_batch,
+        )
+        _log_cuda_memory(target_device, "After partitioning pinned streaming source")
+
+        gpu_batch: dict[str, torch.Tensor] = {}
+        total_non_block = len(non_block_sd)
+        for index, (state_key, tensor) in enumerate(non_block_sd.items(), start=1):
+            gpu_batch[state_key] = tensor.to(device=target_device, dtype=dtype)
+            if len(gpu_batch) >= non_block_load_batch:
+                meta_model.load_state_dict(gpu_batch, strict=False, assign=True)
+                gpu_batch.clear()
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                if index == non_block_load_batch or index % max(non_block_load_batch * 16, non_block_load_batch) == 0:
+                    _log_cuda_memory(target_device, f"Pinned source loaded {index}/{total_non_block} non-block tensors")
+
+        if gpu_batch:
+            meta_model.load_state_dict(gpu_batch, strict=False, assign=True)
+            gpu_batch.clear()
+            if target_device.type == "cuda":
+                torch.cuda.synchronize(target_device)
+
+        _log_cuda_memory(target_device, "After loading non-block weights into model")
         del model_sd, non_block_sd
 
-        # Pin block weights one block at a time, freeing the source tensors as we go.
-        pinned: dict[int, dict[str, torch.Tensor]] = {}
+        # Build block weights in CPU RAM. Pinned host memory is faster for H2D, but
+        # 46GB-class checkpoints can exhaust the CUDA host registration budget on
+        # Windows/8GB cards. Default to pageable RAM and allow opting into pinned
+        # blocks through LTX_CPU_STREAM_MODE=pinned.
+        cpu_blocks: dict[int, dict[str, torch.Tensor]] = {}
         for idx in range(cpu_slots_count):
             src = block_tensors.pop(idx)
-            pinned[idx] = {name: tensor.to(dtype=dtype).pin_memory() for name, tensor in src.items()}
+            if use_pinned_blocks:
+                cpu_blocks[idx] = {name: tensor.to(dtype=dtype).pin_memory() for name, tensor in src.items()}
+            else:
+                cpu_blocks[idx] = {name: tensor.to(dtype=dtype).contiguous() for name, tensor in src.items()}
 
-        return PinnedWeightSource(pinned), []
+        _log_cuda_memory(target_device, "After materializing CPU block weights")
+
+        return (PinnedWeightSource(cpu_blocks) if use_pinned_blocks else RamWeightSource(cpu_blocks)), []
 
     def _build_disk_source(
         self,
@@ -406,14 +473,39 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         matmul_device: torch.device | None = None,
     ) -> None:
         """Load non-block weights into *model* on *device*."""
+        batch_size = _env_int("LTX_NON_BLOCK_LOAD_BATCH", 1 if device.type == "cuda" else 64)
         state_dict: dict[str, torch.Tensor] = {}
         sources = lora_sources or []
-        for sft_key, model_key in non_block_keys:
+
+        logger.info(
+            "Loading %s non-block tensors onto %s in batches of %s",
+            len(non_block_keys),
+            device,
+            batch_size,
+        )
+        _log_cuda_memory(device, "Before loading non-block tensors")
+
+        def flush_state_dict() -> None:
+            if not state_dict:
+                return
+            model.load_state_dict(state_dict, strict=False, assign=True)
+            state_dict.clear()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+        for index, (sft_key, model_key) in enumerate(non_block_keys, start=1):
             tensor = reader.get_tensor(sft_key).to(device=device, dtype=dtype)
             tensor = StreamingModelBuilder._fuse_lora_delta(model_key, tensor, sources, matmul_device)
             if sd_ops is not None:
                 for kv in sd_ops.apply_to_key_value(model_key, tensor):
                     state_dict[key_prefix + kv.new_key] = kv.new_value
-                continue
-            state_dict[key_prefix + model_key] = tensor
-        model.load_state_dict(state_dict, strict=False, assign=True)
+            else:
+                state_dict[key_prefix + model_key] = tensor
+
+            if len(state_dict) >= batch_size:
+                flush_state_dict()
+                if index == batch_size or index % max(batch_size * 16, batch_size) == 0:
+                    _log_cuda_memory(device, f"Loaded {index}/{len(non_block_keys)} non-block tensors")
+
+        flush_state_dict()
+        _log_cuda_memory(device, "Finished loading non-block tensors")
