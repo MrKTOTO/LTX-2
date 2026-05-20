@@ -245,6 +245,7 @@ class DistilledPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         logger.info("[LTX distilled] Stage 2 latent upsampling")
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        preserved_audio_state = audio_state
         del video_state, audio_state
         self._empty_cuda_cache(self.device, self.stage_2_device)
 
@@ -346,9 +347,9 @@ class DistilledPipeline:
 
         logger.info("[LTX distilled] Creating video decoder iterator")
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
-        if generate_audio and audio_state is not None:
+        if generate_audio and preserved_audio_state is not None:
             logger.info("[LTX distilled] Decoding audio")
-            decoded_audio = self.audio_decoder(audio_state.latent)
+            decoded_audio = self.audio_decoder(preserved_audio_state.latent)
         else:
             decoded_audio = None
         logger.info("[LTX distilled] Pipeline tensors ready in %.1fs", time.monotonic() - started_at)
