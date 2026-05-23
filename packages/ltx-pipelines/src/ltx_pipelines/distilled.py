@@ -294,18 +294,15 @@ class DistilledPipeline:
                 tiled_latent_overlap=tiled_latent_overlap,
                 tiled_devices=tiled_devices,
             )
-        elif (
-            not generate_audio
-            and stage_2_tiled_threshold_frames > 0
-            and num_frames > stage_2_tiled_threshold_frames
-        ):
+        elif stage_2_tiled_threshold_frames > 0 and num_frames > stage_2_tiled_threshold_frames:
             logger.info(
                 "[LTX distilled] Stage 2-only tiled denoising enabled for %s frames "
-                "(threshold=%s, latent_tile=%s, overlap=%s)",
+                "(threshold=%s, latent_tile=%s, overlap=%s, audio_preserved=%s)",
                 num_frames,
                 stage_2_tiled_threshold_frames,
                 stage_2_tiled_latent_frames,
                 stage_2_tiled_latent_overlap,
+                generate_audio,
             )
             video_state, audio_state = self._run_tiled_video_stage(
                 stage=stage_2_stage,
