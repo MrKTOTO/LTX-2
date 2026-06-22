@@ -52,6 +52,49 @@ from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 logger = logging.getLogger(__name__)
 
 
+def _log_vram(device: torch.device | None, tag: str, latent_shape: object | None = None) -> None:
+    """Log free/total VRAM and (optionally) the latent token count for a device.
+
+    Used to diagnose Stage 1/2 OOMs: an OOM on the *first* activation allocation
+    means free VRAM was already near zero (device contention / resident weights),
+    while a huge token count means a single N*dim residual simply will not fit.
+    """
+    try:
+        if device is None or torch.device(device).type != "cuda":
+            return
+        dev = torch.device(device)
+        free, total = torch.cuda.mem_get_info(dev)
+        allocated = torch.cuda.memory_allocated(dev)
+        reserved = torch.cuda.memory_reserved(dev)
+        mib = 1024 * 1024
+        token_info = ""
+        if latent_shape is not None:
+            try:
+                dims = tuple(int(d) for d in latent_shape)
+                # Shape is (batch, channels, frames, h, w); transformer tokens are
+                # frames*h*w (one token per spatio-temporal latent position), each
+                # later projected to the model dim -- channels/batch are NOT tokens.
+                spatial = dims[2:] if len(dims) > 2 else dims
+                tokens = 1
+                for d in spatial:
+                    tokens *= d
+                token_info = f", latent={dims}, video_tokens={tokens}"
+            except Exception:
+                token_info = ""
+        logger.info(
+            "[LTX VRAM][%s] %s: free=%.0fMiB / total=%.0fMiB (torch allocated=%.0fMiB, reserved=%.0fMiB)%s",
+            tag,
+            dev,
+            free / mib,
+            total / mib,
+            allocated / mib,
+            reserved / mib,
+            token_info,
+        )
+    except Exception as exc:  # diagnostics must never break generation
+        logger.debug("[LTX VRAM] failed to read memory info for %s: %s", device, exc)
+
+
 class DistilledPipeline:
     """
     Two-stage distilled video generation pipeline.
@@ -213,6 +256,10 @@ class DistilledPipeline:
         )
 
         logger.info("[LTX distilled] Stage 1 denoising")
+        _stage_1_latent_shape = VideoLatentShape.from_pixel_shape(
+            VideoPixelShape(batch=1, frames=num_frames, height=stage_1_h, width=stage_1_w, fps=frame_rate)
+        )
+        _log_vram(self.device, "stage1-start", _stage_1_latent_shape)
         if tiled_denoising and not generate_audio:
             video_state, audio_state = self._run_tiled_video_stage(
                 stage=self.stage,
@@ -277,6 +324,10 @@ class DistilledPipeline:
             self._empty_cuda_cache(self.device, stage_2_device)
 
         logger.info("[LTX distilled] Stage 2 denoising")
+        _stage_2_latent_shape = VideoLatentShape.from_pixel_shape(
+            VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate)
+        )
+        _log_vram(stage_2_device, "stage2-start", _stage_2_latent_shape)
         if tiled_denoising and not generate_audio:
             video_state, audio_state = self._run_tiled_video_stage(
                 stage=stage_2_stage,
