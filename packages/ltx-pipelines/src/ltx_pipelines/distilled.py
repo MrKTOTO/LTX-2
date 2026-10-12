@@ -563,6 +563,38 @@ class DistilledPipeline:
         return video_state, None
 
 
+def parse_devices(value: str | None) -> list[torch.device] | None:
+    if not value:
+        return None
+    return [torch.device(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def build_pipeline_from_args(args: object, pipeline_cls: type[DistilledPipeline] = DistilledPipeline) -> DistilledPipeline:
+    """Construct the pipeline from parsed CLI arguments (shared with the scene-batch CLI)."""
+    device = torch.device(args.device) if args.device else None
+    prompt_encoder_device = torch.device(args.prompt_encoder_device) if args.prompt_encoder_device else None
+    stage_2_device = torch.device(args.stage_2_device) if args.stage_2_device else None
+    prompt_encoder_staging_device = (
+        torch.device(args.prompt_encoder_staging_device) if args.prompt_encoder_staging_device else None
+    )
+    return pipeline_cls(
+        distilled_checkpoint_path=args.distilled_checkpoint_path,
+        spatial_upsampler_path=args.spatial_upsampler_path,
+        gemma_root=args.gemma_root,
+        loras=tuple(args.lora) if args.lora else (),
+        device=device,
+        prompt_encoder_device=prompt_encoder_device,
+        prompt_encoder_staging_device=prompt_encoder_staging_device,
+        stage_2_device=stage_2_device,
+        model_parallel_block_devices=parse_devices(args.model_parallel_block_devices),
+        decoder_devices=parse_devices(args.decoder_devices),
+        quantization=args.quantization,
+        torch_compile=args.compile,
+        offload_mode=args.offload_mode,
+        prompt_encoder_offload_mode=args.prompt_encoder_offload_mode,
+    )
+
+
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", force=True)
@@ -572,41 +604,8 @@ def main() -> None:
     params = detect_params(checkpoint_path)
     parser = default_2_stage_distilled_arg_parser(params=params)
     args = parser.parse_args()
-    device = torch.device(args.device) if args.device else None
-    prompt_encoder_device = torch.device(args.prompt_encoder_device) if args.prompt_encoder_device else None
-    stage_2_device = torch.device(args.stage_2_device) if args.stage_2_device else None
-    model_parallel_block_devices = None
-    if args.model_parallel_block_devices:
-        model_parallel_block_devices = [
-            torch.device(part.strip())
-            for part in args.model_parallel_block_devices.split(",")
-            if part.strip()
-        ]
-    decoder_devices = None
-    if args.decoder_devices:
-        decoder_devices = [torch.device(part.strip()) for part in args.decoder_devices.split(",") if part.strip()]
-    prompt_encoder_staging_device = (
-        torch.device(args.prompt_encoder_staging_device) if args.prompt_encoder_staging_device else None
-    )
-    tiled_devices = None
-    if args.tiled_devices:
-        tiled_devices = [torch.device(part.strip()) for part in args.tiled_devices.split(",") if part.strip()]
-    pipeline = DistilledPipeline(
-        distilled_checkpoint_path=args.distilled_checkpoint_path,
-        spatial_upsampler_path=args.spatial_upsampler_path,
-        gemma_root=args.gemma_root,
-        loras=tuple(args.lora) if args.lora else (),
-        device=device,
-        prompt_encoder_device=prompt_encoder_device,
-        prompt_encoder_staging_device=prompt_encoder_staging_device,
-        stage_2_device=stage_2_device,
-        model_parallel_block_devices=model_parallel_block_devices,
-        decoder_devices=decoder_devices,
-        quantization=args.quantization,
-        torch_compile=args.compile,
-        offload_mode=args.offload_mode,
-        prompt_encoder_offload_mode=args.prompt_encoder_offload_mode,
-    )
+    pipeline = build_pipeline_from_args(args)
+    tiled_devices = parse_devices(args.tiled_devices)
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
     logger.info("[LTX distilled] Video chunks to decode/encode: %s", video_chunks_number)
@@ -638,6 +637,7 @@ def main() -> None:
         audio=audio,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
+        crf=args.output_crf,
     )
     logger.info("[LTX distilled] Finished in %.1fs", time.monotonic() - started_at)
 

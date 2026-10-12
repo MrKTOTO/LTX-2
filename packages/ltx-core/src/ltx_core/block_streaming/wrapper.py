@@ -116,6 +116,18 @@ class BlockStreamingWrapper(nn.Module):
             )
             self._hooks.extend([pre, post])
 
+    def resident_block_window(self) -> int:
+        """How many consecutive blocks can be applied repeatedly without reloading.
+
+        Scene-batched denoising runs a window of blocks for every clip before
+        moving on; a window larger than the GPU buffers would make each clip
+        evict the block the next clip needs.
+        """
+        if len(self._providers) != 1:
+            return 1
+        (provider,) = self._providers.values()
+        return provider.resident_capacity()
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------

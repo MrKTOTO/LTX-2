@@ -325,7 +325,14 @@ def encode_video(
     audio: Audio | None,
     output_path: str,
     video_chunks_number: int,
+    crf: int | None = None,
 ) -> None:
+    """Encode decoded frames (and audio) to an H.264 MP4.
+
+    ``crf`` None keeps libx264's default (CRF 23). That default is fine for a final
+    file but not for an intermediate that gets upscaled and re-encoded: at 1024x576
+    it lands under 1 Mbit/s and smears film grain and fine texture first.
+    """
     logger.info("Preparing video encoder for %s chunk(s)", video_chunks_number)
     if isinstance(video, torch.Tensor):
         video = iter([video])
@@ -341,6 +348,9 @@ def encode_video(
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
+    if crf is not None:
+        stream.options = {"crf": str(int(crf))}
+        logger.info("Video encoder CRF: %s", crf)
 
     if audio is not None:
         logger.info("Preparing audio stream at %s Hz", audio.sampling_rate)

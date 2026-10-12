@@ -22,6 +22,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 | `A2VidPipelineTwoStage` | `a2vid_two_stage.py` | 2 | Full + distilled LoRA | Euler | Audio-conditioned video |
 | `KeyframeInterpolationPipeline` | `keyframe_interpolation.py` | 2 | Full + distilled LoRA | Euler | Keyframe interpolation |
 | `DistilledPipeline` | `distilled.py` | 2 | Distilled only | Euler | Fastest inference |
+| `SceneBatchDistilledPipeline` | `distilled_batch.py` | 2 | Distilled only | Euler | Many clips per process, weights streamed once per step |
 | `ICLoraPipeline` | `ic_lora.py` | 2 | Distilled only | Euler | Video-to-video with IC-LoRA control |
 | `RetakePipeline` | `retake.py` | 1 | Full or distilled | Euler | Video region regeneration |
 
@@ -50,7 +51,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 - `DiffusionStage` -- owns transformer lifecycle; builds model on call, frees on exit via `gpu_model()` context manager (moves params to meta device to release GPU/CPU memory). Accepts optional `stepper` and `loop` overrides.
 - `PromptEncoder` -- Gemma text encoder + embeddings processor (video 4096-dim, audio 2048-dim).
 - `ImageConditioner` / `AudioConditioner` -- temporary encoder scope; builds encoder, passes to callable, frees.
-- `VideoUpsampler` -- 2x spatial upsampling via encoder + upsampler.
+- `VideoUpsampler` -- 2x spatial upsampling via encoder + upsampler; `map(latents)` upsamples several with one load.
 - `VideoDecoder` / `AudioDecoder` -- latent-to-pixel decoding (iterator for video, `Audio` for audio).
 
 ### Memory management
@@ -58,6 +59,19 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 - **Model lifecycle**: All blocks build their model on call and free it on exit. `gpu_model()` moves params to `"meta"` device on exit, immediately releasing storage. No model persists between calls.
 - **Block streaming**: When offloading is enabled, `DiffusionStage` wraps the transformer in `BlockStreamingWrapper`. Blocks live on pinned CPU memory; only 2 blocks are buffered on GPU at a time (one for compute, one for async H2D copy on a separate CUDA stream).
 - **Batch splitting**: `BatchSplitAdapter` wraps the transformer and splits inputs exceeding `max_batch_size` into sequential chunks. If guidance needs B=4 but `max_batch_size=1`, it runs 4 sequential B=1 passes. Higher `max_batch_size` reduces layer-streaming PCIe transfers at the cost of peak memory.
+
+## Scene batching (`distilled_batch.py`, `utils/scene_batch.py`)
+
+`python -m ltx_pipelines.distilled_batch --manifest scenes.json <distilled CLI args>` generates several independent clips (own prompt, seed, frame count and keyframes each) in one process. With block streaming the distilled transformer is bound by weight traffic, not compute (Stage 1 costs about the same for 121 and 425 frames on an 8 GB card), so:
+
+- Prompts are encoded with one Gemma load; VAE encoder/upsampler/decoder are built once per pass.
+- `scene_batched_denoise` runs each step block-major: every block (or a window of blocks that fits the `WeightsProvider` GPU buffers, `BlockStreamingWrapper.resident_block_window()`) is applied to all clips before the next is fetched, so weights stream once per step for the batch.
+- Each clip is still computed alone with the exact ops of `X0Model.forward` (`tests/test_scene_batch.py` asserts bitwise equality). Between blocks a clip's hidden state is parked on the GPU within `--scene-state-gpu-mb` (Stage 1) or in host RAM (Stage 2, always); RoPE tables are rebuilt per visit instead of kept for every clip. Keep `_rope` in sync with `TransformerArgsPreprocessor.prepare` if that changes.
+- Per-clip RNG matches `DistilledPipeline` (video noise, audio noise, Stage 2, decoder from one generator).
+- Stage 1 results are checkpointed to `<output>.stage1.pt` (with an input fingerprint and the RNG state), so a crash in Stage 2 or decoding does not redo Stage 1.
+- No tiled denoising and no Stage 2 tiling: clips that need them go through `distilled.py`.
+
+`--output-crf` (both CLIs) sets libx264 CRF for the written MP4; the default stays libx264's 23.
 
 ## Denoisers (`utils/denoisers.py`)
 

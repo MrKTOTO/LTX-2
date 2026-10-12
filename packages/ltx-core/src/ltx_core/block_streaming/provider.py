@@ -178,6 +178,15 @@ class WeightsProvider:
 
         return h2d_event
 
+    def resident_capacity(self) -> int:
+        """How many consecutive blocks stay on the GPU while being reused.
+
+        GPU prefetch claims buffers ahead of the block in use and evicts the
+        oldest idle one to get them, so only the remaining buffers can hold a
+        run of blocks that is called again and again.
+        """
+        return max(1, self._pool.capacity - self._gpu_prefetch_blocks)
+
     def release(self, idx: int, event: torch.cuda.Event) -> None:
         """Attach a compute-done event -- waited before this buffer is recycled."""
         with self._lock:

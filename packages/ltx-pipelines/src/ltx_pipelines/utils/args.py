@@ -684,4 +684,13 @@ def default_2_stage_distilled_arg_parser(params: PipelineParams = LTX_2_3_PARAMS
         default=16,
         help="Latent-frame overlap blended between neighboring Stage 2-only tiles.",
     )
+    parser.add_argument(
+        "--output-crf",
+        type=int,
+        default=None,
+        help=(
+            "libx264 CRF for the output MP4 (lower = higher quality). Default keeps libx264's 23, "
+            "which is too lossy for a clip that is upscaled and re-encoded downstream."
+        ),
+    )
     return parser

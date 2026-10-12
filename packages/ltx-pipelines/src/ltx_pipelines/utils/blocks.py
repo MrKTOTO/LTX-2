@@ -541,6 +541,10 @@ class VideoUpsampler:
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         """Upsample *latent* using video encoder + spatial upsampler, then free both."""
+        return self.map([latent])[0]
+
+    def map(self, latents: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Upsample several latents with one load of the encoder and upsampler."""
         with (
             gpu_model(
                 self._encoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
@@ -549,7 +553,7 @@ class VideoUpsampler:
                 self._upsampler_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
             ) as upsampler,
         ):
-            return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
+            return [upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler) for latent in latents]
 
 
 # ---------------------------------------------------------------------------
