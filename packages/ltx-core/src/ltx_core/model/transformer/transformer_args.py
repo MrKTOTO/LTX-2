@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+import functools
 import logging
 import os
 
@@ -7,6 +8,7 @@ import torch
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
+    LazyRope,
     LTXRopeType,
     generate_freq_grid_np,
     generate_freq_grid_pytorch,
@@ -14,6 +16,21 @@ from ltx_core.model.transformer.rope import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def block_chunk_tokens() -> int:
+    """Token chunk of the chunked transformer block (``LTX_BLOCK_CHUNK_TOKENS``); 0 = off."""
+    raw_value = os.environ.get("LTX_BLOCK_CHUNK_TOKENS", "").strip()
+    try:
+        return max(0, int(raw_value)) if raw_value else 0
+    except ValueError:
+        return 0
+
+
+def wants_lazy_rope(token_count: int) -> bool:
+    """Whether a sequence is long enough for the chunked block to build RoPE rows on demand."""
+    chunk = block_chunk_tokens()
+    return 0 < chunk < token_count
 
 
 @dataclass(frozen=True)
@@ -41,7 +58,7 @@ class TransformerArgs:
     context_mask: torch.Tensor
     timesteps: torch.Tensor | CompressedTimestep
     embedded_timestep: torch.Tensor | CompressedTimestep
-    positional_embeddings: torch.Tensor
+    positional_embeddings: torch.Tensor | LazyRope
     cross_positional_embeddings: torch.Tensor | None
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
@@ -195,8 +212,9 @@ class TransformerArgsPreprocessor:
         use_middle_indices_grid: bool,
         num_attention_heads: int,
         x_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Prepare positional embeddings."""
+        lazy: bool = False,
+    ) -> torch.Tensor | LazyRope:
+        """Prepare positional embeddings (``lazy``: a ``LazyRope`` that builds rows on demand)."""
         cache_key = self._positional_embeddings_cache_key(
             positions=positions,
             inner_dim=inner_dim,
@@ -204,12 +222,30 @@ class TransformerArgsPreprocessor:
             use_middle_indices_grid=use_middle_indices_grid,
             num_attention_heads=num_attention_heads,
             x_dtype=x_dtype,
-        )
+        ) + (lazy,)
         cached = self._positional_embeddings_cache.get(cache_key)
         if cached is not None:
             return cached
 
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
+        if lazy:
+            pe = LazyRope(
+                positions=positions,
+                build=functools.partial(
+                    precompute_freqs_cis,
+                    dim=inner_dim,
+                    out_dtype=x_dtype,
+                    theta=self.positional_embedding_theta,
+                    max_pos=max_pos,
+                    use_middle_indices_grid=use_middle_indices_grid,
+                    num_attention_heads=num_attention_heads,
+                    rope_type=self.rope_type,
+                    freq_grid_generator=freq_grid_generator,
+                ),
+            )
+            self._positional_embeddings_cache[cache_key] = pe
+            return pe
+
         original_device = positions.device
         scratch_device_name = os.environ.get("LTX_ROPE_SCRATCH_DEVICE", "").strip()
         scratch_device = None
@@ -270,6 +306,7 @@ class TransformerArgsPreprocessor:
             use_middle_indices_grid=self.use_middle_indices_grid,
             num_attention_heads=self.num_attention_heads,
             x_dtype=modality.latent.dtype,
+            lazy=wants_lazy_rope(modality.positions.shape[2]),
         )
         self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
         return TransformerArgs(

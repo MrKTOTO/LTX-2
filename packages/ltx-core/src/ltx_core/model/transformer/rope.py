@@ -1,5 +1,6 @@
 import functools
 import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Tuple
 
@@ -13,11 +14,46 @@ class LTXRopeType(Enum):
     SPLIT = "split"
 
 
+@dataclass(frozen=True)
+class LazyRope:
+    """RoPE tables built for a token range on demand instead of held for the whole sequence.
+
+    The (cos, sin) pair is as large as the hidden state itself, and the token-chunked
+    transformer block only ever needs the rows of the chunk it is working on. Every op in
+    ``precompute_freqs_cis`` is per token, so the rows equal the slice of the full table.
+    """
+
+    positions: torch.Tensor  # (B, n_axes, tokens, 2)
+    build: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+
+    def rows(self, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.build(self.positions[:, :, start:end])
+
+    def full(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.build(self.positions)
+
+
+def rope_rows(
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor] | LazyRope | None, start: int, end: int
+) -> Tuple[torch.Tensor, torch.Tensor] | None:
+    """The RoPE tables of tokens ``start:end``."""
+    if freqs_cis is None:
+        return None
+    if isinstance(freqs_cis, LazyRope):
+        return freqs_cis.rows(start, end)
+    cos_freqs, sin_freqs = freqs_cis
+    # SPLIT tables are (B, H, T, D//2), INTERLEAVED ones (B, T, D).
+    axis = 2 if cos_freqs.ndim == 4 else 1
+    return cos_freqs.narrow(axis, start, end - start), sin_freqs.narrow(axis, start, end - start)
+
+
 def apply_rotary_emb(
     input_tensor: torch.Tensor,
-    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor] | LazyRope,
     rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
 ) -> torch.Tensor:
+    if isinstance(freqs_cis, LazyRope):
+        freqs_cis = freqs_cis.full()
     if rope_type == LTXRopeType.INTERLEAVED:
         return apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
     elif rope_type == LTXRopeType.SPLIT:

@@ -6,8 +6,8 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.transformer.adaln import adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.feed_forward import FeedForward
-from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer_args import CompressedTimestep, TransformerArgs
+from ltx_core.model.transformer.rope import LTXRopeType, rope_rows
+from ltx_core.model.transformer.transformer_args import CompressedTimestep, TransformerArgs, block_chunk_tokens
 from ltx_core.utils import rms_norm
 
 
@@ -165,6 +165,123 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         return scale, shift, gate
 
+    @staticmethod
+    def _ada_rows(
+        scale_shift_table: torch.Tensor,
+        batch_size: int,
+        timestep: torch.Tensor | CompressedTimestep,
+        indices: slice,
+        start: int,
+        end: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """``get_ada_values`` for tokens ``start:end`` only."""
+        num_ada_params = scale_shift_table.shape[0]
+
+        if isinstance(timestep, CompressedTimestep):
+            values = timestep.values.view(timestep.values.shape[0], num_ada_params, -1)[:, indices, :]
+            table = scale_shift_table[indices].to(device=values.device, dtype=values.dtype)
+            rows = timestep.indices.view(timestep.batch_size, timestep.token_count)[:, start:end].reshape(-1)
+            return tuple(
+                (values[:, value_idx, :] + table[value_idx]).index_select(0, rows).view(
+                    timestep.batch_size,
+                    end - start,
+                    -1,
+                )
+                for value_idx in range(values.shape[1])
+            )
+
+        selected = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)
+        if selected.shape[1] != 1:  # one row per token; a single row broadcasts
+            selected = selected[:, start:end]
+        selected = selected[:, :, indices, :]
+        table = scale_shift_table[indices].to(device=timestep.device, dtype=timestep.dtype)
+        return tuple(selected[:, :, value_idx, :] + table[value_idx] for value_idx in range(selected.shape[2]))
+
+    def _modulated_rows(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor | CompressedTimestep,
+        indices: slice,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """AdaLN-modulated ``rms_norm`` of tokens ``start:end`` (``indices`` = shift, scale)."""
+        shift, scale = self._ada_rows(self.scale_shift_table, x.shape[0], timestep, indices, start, end)
+        out = rms_norm(x[:, start:end], eps=self.norm_eps)
+        scale.add_(1)
+        out.mul_(scale)
+        out.add_(shift)
+        return out
+
+    def _chunked_video_attention(self, vx: torch.Tensor, video: TransformerArgs, chunk: int, with_ff: bool) -> None:
+        """Video self-attention, text cross-attention (and the MLP) over token chunks, in place.
+
+        Only the residual stream and the self-attention keys/values span the whole
+        sequence; every other activation is ``chunk`` tokens wide, so the peak drops from
+        ~8 to ~3 hidden-state sizes. Keys/values come from the block input, so a chunk
+        may update its residual rows as soon as its queries are answered. Attention rows,
+        norms, AdaLN and the MLP are per token, so the result matches the unchunked path.
+        """
+        batch_size, tokens = vx.shape[0], vx.shape[1]
+        spans = [(start, min(start + chunk, tokens)) for start in range(0, tokens, chunk)]
+        pe = video.positional_embeddings
+        self_mask = video.self_attention_mask
+
+        keys = vx.new_empty((batch_size, tokens, self.attn1.heads * self.attn1.dim_head))
+        values = torch.empty_like(keys)
+        for start, end in spans:
+            attn_input = self._modulated_rows(vx, video.timesteps, slice(0, 2), start, end)
+            k, v = self.attn1.project_kv(attn_input, rope_rows(pe, start, end))
+            keys[:, start:end].copy_(k)
+            values[:, start:end].copy_(v)
+            del attn_input, k, v
+
+        context = video.context
+        if self.cross_attention_adaln:
+            prompt_timestep = expand_timestep(video.prompt_timestep)
+            shift_kv, scale_kv = (
+                self.prompt_scale_shift_table[None, None].to(device=vx.device, dtype=vx.dtype)
+                + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+            ).unbind(dim=2)
+            context = context * (1 + scale_kv)
+            context.add_(shift_kv)
+            del shift_kv, scale_kv
+        context_k, context_v = self.attn2.project_kv(context)
+        del context
+
+        for start, end in spans:
+            rows = vx[:, start:end]
+            attn_input = self._modulated_rows(vx, video.timesteps, slice(0, 2), start, end)
+            (gate,) = self._ada_rows(self.scale_shift_table, batch_size, video.timesteps, slice(2, 3), start, end)
+            self.attn1.add_chunk_to_residual(
+                rows,
+                attn_input,
+                keys,
+                values,
+                outer_gate=gate,
+                mask=None if self_mask is None else self_mask[:, :, start:end],
+                pe=rope_rows(pe, start, end),
+            )
+            del attn_input, gate
+
+            if self.cross_attention_adaln:
+                attn_input = self._modulated_rows(vx, video.timesteps, slice(6, 8), start, end)
+                (gate,) = self._ada_rows(self.scale_shift_table, batch_size, video.timesteps, slice(8, 9), start, end)
+            else:
+                attn_input, gate = rms_norm(rows, eps=self.norm_eps), None
+            self.attn2.add_chunk_to_residual(rows, attn_input, context_k, context_v, outer_gate=gate, mask=video.context_mask)
+            del attn_input, gate
+
+            if with_ff:
+                self._feed_forward_rows(vx, video, start, end)
+        del keys, values, context_k, context_v
+
+    def _feed_forward_rows(self, vx: torch.Tensor, video: TransformerArgs, start: int, end: int) -> None:
+        vx_scaled = self._modulated_rows(vx, video.timesteps, slice(3, 5), start, end)
+        (gate,) = self._ada_rows(self.scale_shift_table, vx.shape[0], video.timesteps, slice(5, 6), start, end)
+        self.ff.add_to_residual(vx[:, start:end], vx_scaled, gate=gate)
+        del vx_scaled, gate
+
     def _apply_text_cross_attention(
         self,
         x: torch.Tensor,
@@ -217,7 +334,17 @@ class BasicAVTransformerBlock(torch.nn.Module):
         run_a2v = run_vx and (audio is not None and ax.numel() > 0)
         run_v2a = run_ax and (video is not None and vx.numel() > 0)
 
-        if run_vx:
+        chunk = block_chunk_tokens()
+        chunked_vx = (
+            run_vx
+            and 0 < chunk < vx.shape[1]
+            and not perturbations.any_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
+        )
+        # The MLP may join the chunk loop unless audio-video cross-attention sits in between.
+        chunked_ff_done = chunked_vx and not (run_a2v or run_v2a)
+        if chunked_vx:
+            self._chunked_video_attention(vx, video, chunk, with_ff=chunked_ff_done)
+        elif run_vx:
             # Modulate first with only shift/scale live, then allocate the gate
             # right before it is consumed. This keeps at most 4xN*dim activations
             # resident here instead of 6xN*dim (shift+scale+gate plus the `1+scale`
@@ -389,7 +516,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             del vx_norm3, ax_norm3
 
-        if run_vx:
+        if chunked_vx:
+            if not chunked_ff_done:
+                for start in range(0, vx.shape[1], chunk):
+                    self._feed_forward_rows(vx, video, start, min(start + chunk, vx.shape[1]))
+        elif run_vx:
             vshift_mlp, vscale_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 5)
             )

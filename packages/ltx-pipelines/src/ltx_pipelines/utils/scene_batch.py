@@ -24,7 +24,11 @@ import torch
 
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.model.transformer.transformer_args import MultiModalTransformerArgsPreprocessor, TransformerArgs
+from ltx_core.model.transformer.transformer_args import (
+    MultiModalTransformerArgsPreprocessor,
+    TransformerArgs,
+    wants_lazy_rope,
+)
 from ltx_core.types import LatentState
 from ltx_core.utils import to_denoised
 from ltx_pipelines.utils.helpers import modality_from_latent_state
@@ -66,6 +70,7 @@ def _rope(
         use_middle_indices_grid=simple.use_middle_indices_grid,
         num_attention_heads=simple.num_attention_heads,
         x_dtype=dtype,
+        lazy=wants_lazy_rope(modality.positions.shape[2]),
     )
     cross_pe = None
     if isinstance(preprocessor, MultiModalTransformerArgsPreprocessor) and cross_modality is not None:

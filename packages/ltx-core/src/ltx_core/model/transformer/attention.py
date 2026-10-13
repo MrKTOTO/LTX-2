@@ -218,21 +218,75 @@ class Attention(torch.nn.Module):
             if perturbation_mask is not None:
                 out = out * perturbation_mask + v * (1 - perturbation_mask)
 
-        # Apply per-head gating if enabled
-        if self.to_gate_logits is not None:
-            gate_logits = self.to_gate_logits(x)  # (B, T, H)
-            b, t, _ = out.shape
-            # Reshape to (B, T, H, D) for per-head gating
-            out = out.view(b, t, self.heads, self.dim_head)
-            # Apply gating: 2 * sigmoid(x) so that zero-init gives identity (2 * 0.5 = 1.0)
-            gates = torch.sigmoid(gate_logits)  # (B, T, H)
-            gates.mul_(2.0)
-            out.mul_(gates.unsqueeze(-1))  # (B, T, H, D) * (B, T, H, 1)
-            # Reshape back to (B, T, H*D)
-            out = out.view(b, t, self.heads * self.dim_head)
-            del gate_logits, gates
+        return self._gate_heads(out, x)
 
+    def _gate_heads(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Apply per-head gating if enabled."""
+        if self.to_gate_logits is None:
+            return out
+        gate_logits = self.to_gate_logits(x)  # (B, T, H)
+        b, t, _ = out.shape
+        # Reshape to (B, T, H, D) for per-head gating
+        out = out.view(b, t, self.heads, self.dim_head)
+        # Apply gating: 2 * sigmoid(x) so that zero-init gives identity (2 * 0.5 = 1.0)
+        gates = torch.sigmoid(gate_logits)  # (B, T, H)
+        gates.mul_(2.0)
+        out.mul_(gates.unsqueeze(-1))  # (B, T, H, D) * (B, T, H, 1)
+        # Reshape back to (B, T, H*D)
+        out = out.view(b, t, self.heads * self.dim_head)
+        del gate_logits, gates
         return out
+
+    def _add_projected(
+        self, residual: torch.Tensor, out: torch.Tensor, outer_gate: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Project attention output in token chunks and add it into residual."""
+        chunk_tokens = self._out_chunk_tokens()
+        tokens = out.shape[1]
+        for start in range(0, tokens, chunk_tokens):
+            stop = min(start + chunk_tokens, tokens)
+            projected = self.to_out(out[:, start:stop, :])
+            if outer_gate is not None:
+                projected.mul_(outer_gate[:, start:stop, :])
+            residual[:, start:stop, :].add_(projected)
+            del projected
+        return residual
+
+    def project_kv(
+        self, context: torch.Tensor, k_pe: tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keys (normalized, rotated) and values of ``context``, as ``_attention_out`` computes them."""
+        v = self.to_v(context)
+        k = self.k_norm(self.to_k(context))
+        if k_pe is not None:
+            k = apply_rotary_emb(k, k_pe, self.rope_type)
+        return k, v
+
+    def add_chunk_to_residual(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        outer_gate: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """``add_to_residual`` for a slice of queries against keys/values from ``project_kv``.
+
+        ``residual``, ``x``, ``outer_gate``, ``pe`` and the mask rows cover the same
+        tokens; ``k``/``v`` cover the whole context. Attention rows are independent,
+        so the result equals the matching rows of the unchunked call.
+        """
+        q = self.q_norm(self.to_q(x))
+        if pe is not None:
+            q = apply_rotary_emb(q, pe, self.rope_type)
+        out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
+        del q
+        out = self._gate_heads(out, x)
+        self._add_projected(residual, out, outer_gate)
+        del out
+        return residual
 
     def add_to_residual(
         self,
@@ -259,15 +313,7 @@ class Attention(torch.nn.Module):
             perturbation_mask=perturbation_mask,
             all_perturbed=all_perturbed,
         )
-        chunk_tokens = self._out_chunk_tokens()
-        tokens = out.shape[1]
-        for start in range(0, tokens, chunk_tokens):
-            stop = min(start + chunk_tokens, tokens)
-            projected = self.to_out(out[:, start:stop, :])
-            if outer_gate is not None:
-                projected.mul_(outer_gate[:, start:stop, :])
-            residual[:, start:stop, :].add_(projected)
-            del projected
+        self._add_projected(residual, out, outer_gate)
         del out
         return residual
 

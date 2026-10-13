@@ -885,10 +885,10 @@ class VideoDecoder(nn.Module):
                         :, :, temporal_overlap_slice, :, :
                     ]
 
-                # Yield the non-overlapping part of the previous chunk
-                previous_weights = previous_weights.clamp(min=1e-8)
+                # Yield the non-overlapping part of the previous chunk (divide only that
+                # part: at 1080p a full-chunk temporary is ~0.8 GB)
                 yield_len = curr_temporal_slice.start - previous_temporal_slice.start
-                yield (previous_chunk / previous_weights)[:, :, :yield_len, :, :]
+                yield previous_chunk[:, :, :yield_len, :, :] / previous_weights[:, :, :yield_len, :, :].clamp(min=1e-8)
 
             # Update state for next iteration
             previous_chunk = buffer
@@ -973,7 +973,8 @@ class VideoDecoder(nn.Module):
         """
         temporal_slice = group_tiles[0].out_coords[2]
 
-        weights = torch.zeros_like(buffer)
+        # Blend masks broadcast over batch and channels, so one weight channel is enough.
+        weights = buffer.new_zeros((buffer.shape[0], 1, *buffer.shape[2:]))
 
         for tile in group_tiles:
             decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
