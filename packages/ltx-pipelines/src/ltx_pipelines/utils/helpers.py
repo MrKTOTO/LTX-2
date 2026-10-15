@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -66,6 +67,36 @@ def get_device() -> torch.device:
 
 def cleanup_memory() -> None:
     cleanup_accelerator_memory()
+
+
+def cap_cuda_memory_to_free_vram() -> None:
+    """Bound the CUDA caching allocator by the VRAM free now minus a headroom.
+    Enabled by ``LTX_CUDA_MEMORY_HEADROOM_MB`` (the headroom, in MiB). On Windows (WDDM) an
+    allocation past the card's memory does not fail: the driver moves it to shared system
+    memory and the kernels run many times slower. The caching allocator keeps freed blocks
+    reserved, and with clips, tiles and phases of different sizes its reserve outgrows the
+    card that way (a VAE decode went from 45 s to over 12 min). Under the cap it hands its
+    cache back and retries first, as it would with caching off, and only raises an OOM if
+    live tensors really exceed the card. Pipelines call it after prompt encoding, whose
+    embeddings processor needs nearly the whole card for a moment; by then the CUDA context
+    exists and the encoder is freed, so the reading excludes the context and other
+    processes' usage (the display). The headroom covers what is allocated outside the
+    allocator later.
+    """
+    raw_headroom = os.environ.get("LTX_CUDA_MEMORY_HEADROOM_MB", "").strip()
+    if not raw_headroom or not torch.cuda.is_available():
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    free, total = torch.cuda.mem_get_info(device)
+    limit = free - int(raw_headroom) * 1024 * 1024
+    fraction = min(1.0, max(0.05, limit / total))
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    logger.info(
+        "CUDA allocator capped at %.2f GB (%.2f GB free at start, headroom %s MiB)",
+        fraction * total / 2**30,
+        free / 2**30,
+        raw_headroom,
+    )
 
 
 def create_initial_video_latent(

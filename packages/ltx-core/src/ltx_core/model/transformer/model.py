@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import Enum
 
 import torch
@@ -13,6 +14,7 @@ from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
 from ltx_core.model.transformer.transformer_args import (
     BlockPerturbationsProcessor,
+    CompressedTimestep,
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
     TransformerArgsPreprocessor,
@@ -20,6 +22,14 @@ from ltx_core.model.transformer.transformer_args import (
 from ltx_core.utils import to_denoised
 
 logger = logging.getLogger(__name__)
+
+
+def _output_chunk_tokens() -> int:
+    """Token chunk of the output projection (``LTX_OUTPUT_CHUNK_TOKENS``); 0 = whole sequence."""
+    try:
+        return max(0, int(os.environ.get("LTX_OUTPUT_CHUNK_TOKENS", "1024").strip()))
+    except ValueError:
+        return 1024
 
 
 class LTXModelType(Enum):
@@ -471,19 +481,34 @@ class LTXModel(torch.nn.Module, Disposable):
         norm_out: torch.nn.LayerNorm,
         proj_out: torch.nn.Linear,
         x: torch.Tensor,
-        embedded_timestep: torch.Tensor,
+        embedded_timestep: torch.Tensor | CompressedTimestep,
     ) -> torch.Tensor:
-        """Process output for LTXV."""
-        # Apply scale-shift modulation
-        scale_shift_values = (
-            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
-        )
-        shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-
+        """Process output for LTXV.
+        Modulated and projected in token chunks (``LTX_OUTPUT_CHUNK_TOKENS``): the dense
+        per-token shift/scale would otherwise add two hidden-state sizes at the very end.
+        """
         x = norm_out(x)
-        x = x * (1 + scale) + shift
-        x = proj_out(x)
-        return x
+        table = scale_shift_table.to(device=x.device, dtype=x.dtype)
+        tokens = x.shape[1]
+        chunk_tokens = _output_chunk_tokens() or tokens
+        out = x.new_empty((x.shape[0], tokens, proj_out.out_features))
+        for start in range(0, tokens, chunk_tokens):
+            end = min(start + chunk_tokens, tokens)
+            if isinstance(embedded_timestep, CompressedTimestep):
+                timestep_chunk = embedded_timestep.expand_token_range(start, end)
+            elif embedded_timestep.shape[1] == 1:
+                timestep_chunk = embedded_timestep
+            else:
+                timestep_chunk = embedded_timestep[:, start:end]
+            shift = table[0] + timestep_chunk
+            scale = table[1] + timestep_chunk
+            x_chunk = x[:, start:end]
+            scale.add_(1)
+            x_chunk.mul_(scale)
+            x_chunk.add_(shift)
+            out[:, start:end] = proj_out(x_chunk)
+            del shift, scale, timestep_chunk
+        return out
 
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig | None

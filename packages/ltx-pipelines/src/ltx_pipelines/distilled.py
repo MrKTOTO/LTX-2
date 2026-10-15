@@ -1,3 +1,4 @@
+import argparse
 import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SI
 from ltx_pipelines.utils.helpers import (
     assert_generated_keyframes_request,
     assert_resolution,
+    cap_cuda_memory_to_free_vram,
     ensure_tiling_config,
     get_device,
     snap_frames_to_grid,
@@ -91,6 +93,9 @@ ANCESTRAL_NOISE_SEED_OFFSET = 10000
 # Every pass draws from its own offset, so no two of them inject the same noise.
 ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET = 20000
 
+# encode_video's own default.
+DEFAULT_OUTPUT_CRF = 19
+
 
 def ancestral_sampler_kwargs(seed: int, dtype: torch.dtype, noise_seed_offset: int) -> dict[str, Any]:
     """``loop`` override that samples a :class:`DiffusionStage` with ancestral Euler.
@@ -124,6 +129,20 @@ def ancestral_sampler_kwargs(seed: int, dtype: torch.dtype, noise_seed_offset: i
         return result
 
     return {"loop": ancestral_loop}
+
+
+def add_output_crf_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--output-crf``, the libx264 CRF of the written MP4 (shared with the scene-batch CLI)."""
+    parser.add_argument(
+        "--output-crf",
+        type=int,
+        default=DEFAULT_OUTPUT_CRF,
+        help=(
+            f"libx264 CRF of the output MP4, lower is higher quality (default: {DEFAULT_OUTPUT_CRF}). "
+            "Lower it for a clip that is upscaled and re-encoded downstream."
+        ),
+    )
+    return parser
 
 
 def should_use_ancestral_sampler(transformer_path: str) -> bool:
@@ -276,6 +295,9 @@ class DistilledPipeline:
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        # After the prompt encoder: its embeddings processor (~6 GB of connector weights on
+        # LTX-2.5) needs nearly the whole card, the denoising and decoding phases do not.
+        cap_cuda_memory_to_free_vram()
 
         resolved_num_frames = snap_frames_to_grid(
             resolve_num_frames(
@@ -507,10 +529,12 @@ class DistilledPipeline:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     params = resolve_cli_params(distilled=True)
-    parser = add_chunk_layout_args(
-        add_keyframe_decode_arg(
-            add_generated_keyframes_arg(
-                default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True)
+    parser = add_output_crf_arg(
+        add_chunk_layout_args(
+            add_keyframe_decode_arg(
+                add_generated_keyframes_arg(
+                    default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True)
+                )
             )
         )
     )
@@ -564,6 +588,7 @@ def main() -> None:
         video_chunks_number=video_chunks_number,
         color_space=hdr,
         audio_sampling_rate=audio_sampling_rate,
+        crf=args.output_crf,
     )
 
 

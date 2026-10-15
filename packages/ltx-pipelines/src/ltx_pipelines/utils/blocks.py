@@ -510,6 +510,13 @@ class DiffusionStage:
             return self._streaming_transformer_ctx()
         return gpu_model(self._build_transformer(**kwargs), alloc_trim_strategy=self._alloc_trim_strategy)
 
+    def model_context(self, **kwargs: object) -> AbstractContextManager:
+        """The built transformer (``X0Model``) for callers that run their own loop, freed on exit.
+        Used by scene-batched denoising (``utils/scene_batch.py``), which drives several clips
+        through one build; ``__call__`` is the single-clip equivalent.
+        """
+        return self._transformer_ctx(**kwargs)
+
     def __call__(
         self,
         denoiser: Denoiser,
@@ -806,6 +813,33 @@ class PromptEncoder:
         logger.info("Prompt encoding complete")
         return result
 
+    def encode_each(self, prompts: Sequence[str]) -> list[EmbeddingsProcessorOutput]:
+        """Encode prompts one at a time, with one text-encoder and one embeddings-processor load.
+        ``__call__`` runs all prompts as one Gemma batch padded to 1024 tokens, so its hidden
+        states grow by ~0.4 GB per prompt on the GPU. Here each prompt is encoded alone --
+        exactly as a single-prompt ``__call__`` encodes it -- and its hidden states wait in
+        host RAM until the embeddings processor takes them.
+        """
+        logger.info("Building text encoder from %s for %d prompts", self._text_encoder_path, len(prompts))
+        staged = []
+        with self._text_encoder_ctx() as text_encoder:
+            for prompt in prompts:
+                ((hidden_states, mask),) = text_encoder.encode([prompt])
+                staged.append((tuple(h.to("cpu") for h in hidden_states), mask.to("cpu")))
+                del hidden_states, mask
+        with gpu_model(
+            self._build_embeddings_processor(), alloc_trim_strategy=self._alloc_trim_strategy
+        ) as embeddings_processor:
+            result = []
+            for hidden_states, mask in staged:
+                result.append(
+                    embeddings_processor.process_hidden_states(
+                        tuple(h.to(self._device) for h in hidden_states), mask.to(self._device)
+                    )
+                )
+        logger.info("Prompt encoding complete")
+        return result
+
 
 # ---------------------------------------------------------------------------
 # DurationPredictor
@@ -1038,6 +1072,10 @@ class VideoUpsampler:
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         """Upsample *latent* using video encoder + spatial upsampler, then free both."""
+        return self.map([latent])[0]
+
+    def map(self, latents: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+        """Upsample several latents with one load of the encoder and the upsampler."""
         logger.info("Building video encoder + spatial upsampler from %s", self._upsampler_path)
         with (
             gpu_model(
@@ -1049,7 +1087,7 @@ class VideoUpsampler:
                 alloc_trim_strategy=self._alloc_trim_strategy,
             ) as upsampler,
         ):
-            return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
+            return [upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler) for latent in latents]
 
 
 # ---------------------------------------------------------------------------

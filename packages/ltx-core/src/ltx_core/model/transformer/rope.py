@@ -1,5 +1,6 @@
 import functools
 import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Tuple
 
@@ -13,11 +14,45 @@ class LTXRopeType(Enum):
     SPLIT = "split"
 
 
+@dataclass(frozen=True)
+class LazyRope:
+    """RoPE tables built for a token range on demand instead of held for the whole sequence.
+    The (cos, sin) pair is as large as the hidden state itself, and the token-chunked
+    transformer block only ever needs the rows of the chunk it is working on. Every op in
+    ``precompute_freqs_cis`` is per token, so the rows equal the slice of the full table.
+    """
+
+    positions: torch.Tensor  # (B, n_axes, tokens, 2)
+    build: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+
+    def rows(self, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.build(self.positions[:, :, start:end])
+
+    def full(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.build(self.positions)
+
+
+def rope_rows(
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor] | LazyRope | None, start: int, end: int
+) -> Tuple[torch.Tensor, torch.Tensor] | None:
+    """The RoPE tables of tokens ``start:end``."""
+    if freqs_cis is None:
+        return None
+    if isinstance(freqs_cis, LazyRope):
+        return freqs_cis.rows(start, end)
+    cos_freqs, sin_freqs = freqs_cis
+    # SPLIT tables are (B, H, T, D//2), INTERLEAVED ones (B, T, D).
+    axis = 2 if cos_freqs.ndim == 4 else 1
+    return cos_freqs.narrow(axis, start, end - start), sin_freqs.narrow(axis, start, end - start)
+
+
 def apply_rotary_emb(
     input_tensor: torch.Tensor,
-    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor] | LazyRope,
     rope_type: LTXRopeType = LTXRopeType.SPLIT,
 ) -> torch.Tensor:
+    if isinstance(freqs_cis, LazyRope):
+        freqs_cis = freqs_cis.full()
     if rope_type == LTXRopeType.INTERLEAVED:
         # Note: INTERLEAVED rope is a legacy mode. Prefer SPLIT instead.
         return apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
@@ -165,9 +200,13 @@ def generate_freqs(
     return freqs
 
 
-def split_freqs_cis(freqs: torch.Tensor, pad_size: int, num_attention_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
-    cos_freq = freqs.cos()
-    sin_freq = freqs.sin()
+def split_freqs_cis(
+    freqs: torch.Tensor, pad_size: int, num_attention_heads: int, out_dtype: torch.dtype | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Cast before padding/reshaping: the float32 tables are twice the size of the bf16
+    # ones, and every later op is a copy, so the result is identical.
+    cos_freq = freqs.cos().to(out_dtype or freqs.dtype)
+    sin_freq = freqs.sin_().to(out_dtype or freqs.dtype)
 
     if pad_size != 0:
         cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
@@ -188,9 +227,11 @@ def split_freqs_cis(freqs: torch.Tensor, pad_size: int, num_attention_heads: int
     return cos_freq, sin_freq
 
 
-def interleaved_freqs_cis(freqs: torch.Tensor, pad_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
-    sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
+def interleaved_freqs_cis(
+    freqs: torch.Tensor, pad_size: int, out_dtype: torch.dtype | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos_freq = freqs.cos().to(out_dtype or freqs.dtype).repeat_interleave(2, dim=-1)
+    sin_freq = freqs.sin_().to(out_dtype or freqs.dtype).repeat_interleave(2, dim=-1)
     if pad_size != 0:
         cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
         sin_padding = torch.zeros_like(cos_freq[:, :, :pad_size])
@@ -222,9 +263,9 @@ def precompute_freqs_cis(
         expected_freqs = dim // 2
         current_freqs = freqs.shape[-1]
         pad_size = expected_freqs - current_freqs
-        cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads)
+        cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads, out_dtype)
     else:
         # 2 because of cos and sin by 3 for (t, x, y), 1 for temporal only
         n_elem = 2 * indices_grid.shape[1]
-        cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem)
-    return cos_freq.to(out_dtype), sin_freq.to(out_dtype)
+        cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem, out_dtype)
+    return cos_freq, sin_freq

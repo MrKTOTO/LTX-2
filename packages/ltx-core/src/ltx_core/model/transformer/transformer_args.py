@@ -1,3 +1,5 @@
+import functools
+import os
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, replace
 
@@ -7,6 +9,7 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
+    LazyRope,
     LTXRopeType,
     generate_freq_grid_np,
     generate_freq_grid_pytorch,
@@ -43,16 +46,98 @@ def apply_keyframes_absolute_embedding(
     return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
 
 
+def block_chunk_tokens() -> int:
+    """Token chunk of the chunked transformer block (``LTX_BLOCK_CHUNK_TOKENS``); 0 = off."""
+    raw_value = os.environ.get("LTX_BLOCK_CHUNK_TOKENS", "").strip()
+    try:
+        return max(0, int(raw_value)) if raw_value else 0
+    except ValueError:
+        return 0
+
+
+def wants_lazy_rope(token_count: int) -> bool:
+    """Whether a sequence is long enough for the chunked block to build RoPE rows on demand."""
+    chunk = block_chunk_tokens()
+    return 0 < chunk < token_count
+
+
+def compress_timesteps_enabled() -> bool:
+    """Per-token AdaLN values stored once per distinct timestep (``LTX_COMPRESS_TIMESTEPS``, on by default)."""
+    return os.environ.get("LTX_COMPRESS_TIMESTEPS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+@dataclass(frozen=True)
+class CompressedTimestep:
+    """Per-token AdaLN embeddings stored once per distinct timestep.
+    With image conditioning the timesteps are per token (``denoise_mask * sigma``), so the
+    AdaLN output is ``(B, tokens, k * dim)`` -- at Stage 2 resolution several GB -- although
+    it holds only two or three distinct rows. ``values`` keeps those rows and ``indices``
+    maps every token to its row, so any token range expands to exactly what the dense
+    tensor holds there.
+    """
+
+    values: torch.Tensor  # (unique, k * dim)
+    indices: torch.Tensor  # (B * tokens,)
+    batch_size: int
+    token_count: int
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Shape of the dense tensor this stands for."""
+        return (self.batch_size, self.token_count, self.values.shape[-1])
+
+    @property
+    def device(self) -> torch.device:
+        return self.values.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.values.dtype
+
+    def expand(self) -> torch.Tensor:
+        return self.values.index_select(0, self.indices).view(self.batch_size, self.token_count, -1)
+
+    def token_indices(self, start: int, end: int) -> torch.Tensor:
+        return self.indices.view(self.batch_size, self.token_count)[:, start:end].reshape(-1)
+
+    def expand_token_range(self, start: int, end: int) -> torch.Tensor:
+        return self.values.index_select(0, self.token_indices(start, end)).view(self.batch_size, end - start, -1)
+
+
+def dense_timestep(timestep: torch.Tensor | CompressedTimestep | None) -> torch.Tensor | None:
+    """The dense ``(B, tokens or 1, k * dim)`` tensor, expanding a :class:`CompressedTimestep`."""
+    if isinstance(timestep, CompressedTimestep):
+        return timestep.expand()
+    return timestep
+
+
+def timestep_rows(
+    timestep: torch.Tensor | CompressedTimestep, num_params: int, indices: slice, start: int, end: int
+) -> torch.Tensor:
+    """``timestep`` rows of tokens ``start:end`` as ``(B, end - start or 1, len(indices), dim)``.
+    A dense timestep with a single row (one sigma for the whole sequence) stays one row and
+    broadcasts.
+    """
+    if isinstance(timestep, CompressedTimestep):
+        values = timestep.values.view(timestep.values.shape[0], num_params, -1)[:, indices, :]
+        rows = values.index_select(0, timestep.token_indices(start, end))
+        return rows.view(timestep.batch_size, end - start, rows.shape[1], -1)
+    selected = timestep.reshape(timestep.shape[0], timestep.shape[1], num_params, -1)
+    if selected.shape[1] != 1:
+        selected = selected[:, start:end]
+    return selected[:, :, indices, :]
+
+
 @dataclass(frozen=True)
 class TransformerArgs:
     x: torch.Tensor
     context: torch.Tensor
     context_mask: torch.Tensor
-    timesteps: torch.Tensor
-    embedded_timestep: torch.Tensor
-    positional_embeddings: tuple[torch.Tensor, torch.Tensor]
-    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
-    cross_scale_shift_timestep: torch.Tensor | None
+    timesteps: torch.Tensor | CompressedTimestep
+    embedded_timestep: torch.Tensor | CompressedTimestep
+    positional_embeddings: tuple[torch.Tensor, torch.Tensor] | LazyRope
+    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | LazyRope | None
+    cross_scale_shift_timestep: torch.Tensor | CompressedTimestep | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
@@ -171,12 +256,19 @@ class TransformerArgsPreprocessor:
         self.keyframes_embedding_provider = keyframes_embedding_provider
 
     def _prepare_timestep(
-        self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare timestep embeddings."""
-        timestep_scaled = timestep * self.timestep_scale_multiplier
+        self,
+        timestep: torch.Tensor,
+        adaln: AdaLayerNormSingle,
+        batch_size: int,
+        hidden_dtype: torch.dtype,
+        compress: bool = False,
+    ) -> tuple[torch.Tensor | CompressedTimestep, torch.Tensor | CompressedTimestep]:
+        """Prepare timestep embeddings (``compress``: per-token ones as :class:`CompressedTimestep`)."""
+        timestep_scaled = (timestep * self.timestep_scale_multiplier).flatten()
+        if compress and timestep_scaled.numel() > batch_size:
+            return compressed_adaln(adaln, timestep_scaled, batch_size, hidden_dtype)
         timestep, embedded_timestep = adaln(
-            timestep_scaled.flatten(),
+            timestep_scaled,
             hidden_dtype=hidden_dtype,
         )
         # Second dimension is 1 or number of tokens (if timestep_per_token)
@@ -244,11 +336,12 @@ class TransformerArgsPreprocessor:
         use_middle_indices_grid: bool,
         num_attention_heads: int,
         x_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Prepare positional embeddings."""
+        lazy: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | LazyRope:
+        """Prepare positional embeddings (``lazy``: a :class:`LazyRope` that builds rows on demand)."""
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
-        pe = precompute_freqs_cis(
-            positions,
+        build = functools.partial(
+            precompute_freqs_cis,
             dim=inner_dim,
             out_dtype=x_dtype,
             theta=self.positional_embedding_theta,
@@ -258,7 +351,29 @@ class TransformerArgsPreprocessor:
             rope_type=self.rope_type,
             freq_grid_generator=freq_grid_generator,
         )
-        return pe
+        if lazy:
+            return LazyRope(positions=positions, build=build)
+        return build(positions)
+
+    def positional_embeddings(
+        self,
+        modality: Modality,
+        cross_modality: Modality | None = None,  # noqa: ARG002
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor] | LazyRope, None]:
+        """``(positional_embeddings, cross_positional_embeddings)`` as :meth:`prepare` sets them.
+        Scene-batched denoising parks a clip's args without these tables (at Stage 2 they
+        cost hundreds of MB per clip) and rebuilds them here on every visit.
+        """
+        pe = self._prepare_positional_embeddings(
+            positions=modality.positions,
+            inner_dim=self.inner_dim,
+            max_pos=self.max_pos,
+            use_middle_indices_grid=self.use_middle_indices_grid,
+            num_attention_heads=self.num_attention_heads,
+            x_dtype=modality.latent.dtype,
+            lazy=wants_lazy_rope(modality.positions.shape[2]),
+        )
+        return pe, None
 
     def prepare(
         self,
@@ -269,7 +384,7 @@ class TransformerArgsPreprocessor:
         x = apply_keyframes_absolute_embedding(x, modality.keyframes_mask, self.keyframes_embedding_provider)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, self.adaln, batch_size, modality.latent.dtype
+            modality.timesteps, self.adaln, batch_size, modality.latent.dtype, compress=compress_timesteps_enabled()
         )
         prompt_timestep = None
         if self.prompt_adaln is not None:
@@ -278,14 +393,7 @@ class TransformerArgsPreprocessor:
             )
         context = self._prepare_context(modality.context, x)
         attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
-        pe = self._prepare_positional_embeddings(
-            positions=modality.positions,
-            inner_dim=self.inner_dim,
-            max_pos=self.max_pos,
-            use_middle_indices_grid=self.use_middle_indices_grid,
-            num_attention_heads=self.num_attention_heads,
-            x_dtype=modality.latent.dtype,
-        )
+        pe, _ = self.positional_embeddings(modality)
         self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
         return TransformerArgs(
             x=x,
@@ -346,6 +454,24 @@ class MultiModalTransformerArgsPreprocessor:
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
 
+    def positional_embeddings(
+        self, modality: Modality, cross_modality: Modality | None = None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor] | LazyRope, tuple[torch.Tensor, torch.Tensor] | LazyRope | None]:
+        """``(positional_embeddings, cross_positional_embeddings)`` as :meth:`prepare` sets them."""
+        pe, _ = self.simple_preprocessor.positional_embeddings(modality)
+        if cross_modality is None:
+            return pe, None
+        cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
+            positions=modality.positions[:, 0:1, :],
+            inner_dim=self.audio_cross_attention_dim,
+            max_pos=[self.cross_pe_max_pos],
+            use_middle_indices_grid=True,
+            num_attention_heads=self.simple_preprocessor.num_attention_heads,
+            x_dtype=modality.latent.dtype,
+            lazy=wants_lazy_rope(modality.positions.shape[2]),
+        )
+        return pe, cross_pe
+
     def prepare(
         self,
         modality: Modality,
@@ -361,14 +487,7 @@ class MultiModalTransformerArgsPreprocessor:
             if cross_modality.sigma.ndim != 1:
                 raise ValueError("Cross modality sigma must be a 1D tensor")
 
-        cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
-            positions=modality.positions[:, 0:1, :],
-            inner_dim=self.audio_cross_attention_dim,
-            max_pos=[self.cross_pe_max_pos],
-            use_middle_indices_grid=True,
-            num_attention_heads=self.simple_preprocessor.num_attention_heads,
-            x_dtype=modality.latent.dtype,
-        )
+        _, cross_pe = self.positional_embeddings(modality, cross_modality)
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             modality_timesteps=modality.timesteps,
@@ -392,15 +511,16 @@ class MultiModalTransformerArgsPreprocessor:
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | CompressedTimestep, torch.Tensor]:
         """Prepare A-V cross-attention AdaLN inputs."""
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            (modality_timesteps * timestep_scale_multiplier).flatten(),
-            hidden_dtype=hidden_dtype,
-        )
-        scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
+        scaled = (modality_timesteps * timestep_scale_multiplier).flatten()
+        if compress_timesteps_enabled() and scaled.numel() > batch_size:
+            scale_shift_timestep, _ = compressed_adaln(self.cross_scale_shift_adaln, scaled, batch_size, hidden_dtype)
+        else:
+            scale_shift_timestep, _ = self.cross_scale_shift_adaln(scaled, hidden_dtype=hidden_dtype)
+            scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
 
         gate_noise_timestep, _ = self.cross_gate_adaln(
             (cross_modality_sigma * timestep_scale_multiplier * av_ca_factor).flatten(),
@@ -409,3 +529,19 @@ class MultiModalTransformerArgsPreprocessor:
         gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
 
         return scale_shift_timestep, gate_noise_timestep
+
+
+def compressed_adaln(
+    adaln: AdaLayerNormSingle, timestep_scaled: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype
+) -> tuple[CompressedTimestep, CompressedTimestep]:
+    """``adaln`` over the distinct values of a flattened per-token timestep only.
+    AdaLN is a per-row MLP, so its rows for the distinct inputs, gathered per token, equal
+    the dense output exactly.
+    """
+    unique_timesteps, inverse_indices = torch.unique(timestep_scaled, sorted=True, return_inverse=True)
+    values, embedded_values = adaln(unique_timesteps, hidden_dtype=hidden_dtype)
+    token_count = timestep_scaled.numel() // batch_size
+    return (
+        CompressedTimestep(values, inverse_indices, batch_size, token_count),
+        CompressedTimestep(embedded_values, inverse_indices, batch_size, token_count),
+    )

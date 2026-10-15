@@ -87,10 +87,22 @@ class CudaStreamSync:
         return torch.cuda.stream(self._copy_stream)
 
     def commit_copy(self) -> StreamEvent:
+        event = self.record_copy()
+        self.wait_copy(event)
+        return event
+
+    def record_copy(self) -> StreamEvent:
+        """Record a copy-done event without making compute wait yet (see :meth:`wait_copy`).
+        Lets a block's weights be copied ahead while the previous block computes; the
+        compute stream waits only when the block is actually used.
+        """
         event = torch.cuda.Event()
         event.record(self._copy_stream)
-        torch.cuda.current_stream(self._device).wait_event(event)
         return event
+
+    def wait_copy(self, event: StreamEvent) -> None:
+        """Make compute wait for a copy recorded by :meth:`record_copy`."""
+        torch.cuda.current_stream(self._device).wait_event(event)
 
     def record_compute_done(self) -> StreamEvent:
         event = torch.cuda.Event()

@@ -89,10 +89,12 @@ class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
         # split rope is (B, H, T, D//2) -- dim -2 == 2; interleaved rope is (B, T, D)
         # -- dim -2 == 1. Both work via the negative index.
         torch._dynamo.mark_dynamic(args.x, 1)
-        cos, sin = args.positional_embeddings
-        torch._dynamo.mark_dynamic(cos, cos.ndim - 2)
-        torch._dynamo.mark_dynamic(sin, sin.ndim - 2)
-        if args.cross_positional_embeddings is not None:
+        # A LazyRope (token-chunked block) builds its tables inside the block.
+        if isinstance(args.positional_embeddings, tuple):
+            cos, sin = args.positional_embeddings
+            torch._dynamo.mark_dynamic(cos, cos.ndim - 2)
+            torch._dynamo.mark_dynamic(sin, sin.ndim - 2)
+        if isinstance(args.cross_positional_embeddings, tuple):
             cross_cos, cross_sin = args.cross_positional_embeddings
             torch._dynamo.mark_dynamic(cross_cos, cross_cos.ndim - 2)
             torch._dynamo.mark_dynamic(cross_sin, cross_sin.ndim - 2)
@@ -110,16 +112,17 @@ class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
         # and must vary with it. When they're a single timestep broadcast across the
         # sequence (dim 1 == 1), leaving them static lets Dynamo keep the size-1
         # broadcast.
-        if args.timesteps.shape[1] > 1:
+        # A CompressedTimestep is not a tensor; its rows are gathered inside the block.
+        if isinstance(args.timesteps, torch.Tensor) and args.timesteps.shape[1] > 1:
             torch._dynamo.mark_dynamic(args.timesteps, 1)
-        if args.embedded_timestep.shape[1] > 1:
+        if isinstance(args.embedded_timestep, torch.Tensor) and args.embedded_timestep.shape[1] > 1:
             torch._dynamo.mark_dynamic(args.embedded_timestep, 1)
         # `cross_scale_shift_timestep` is the cross-attn AdaLN scale/shift input
         # derived from the own-modality per-token timesteps (denoise_mask * sigma),
         # so its dim 1 equals the seq length when conditioning is per-token.
         # `cross_gate_timestep` is the cross-modality sigma scalar -- dim 1 is 1
         # and broadcasts, leave it static. Same guard pattern as `timesteps`.
-        if args.cross_scale_shift_timestep is not None and args.cross_scale_shift_timestep.shape[1] > 1:
+        if isinstance(args.cross_scale_shift_timestep, torch.Tensor) and args.cross_scale_shift_timestep.shape[1] > 1:
             torch._dynamo.mark_dynamic(args.cross_scale_shift_timestep, 1)
 
         return args

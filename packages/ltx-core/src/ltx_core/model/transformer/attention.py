@@ -1,4 +1,5 @@
 import functools
+import os
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -507,6 +508,134 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+    @staticmethod
+    def _out_chunk_tokens() -> int:
+        try:
+            return max(1, int(os.environ.get("LTX_ATTENTION_OUT_CHUNK_TOKENS", "2048")))
+        except ValueError:
+            return 2048
+
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        if mask is None:
+            return self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
+        return self.masked_attention_function(q, k, v, self.heads, mask)
+
+    def _gate_heads(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Per-head gating (``2 * sigmoid`` so a zero-initialized gate is the identity), in place."""
+        if self.to_gate_logits is None:
+            return out
+        gates = torch.sigmoid(self.to_gate_logits(x))  # (B, T, H)
+        gates.mul_(2.0)
+        b, t, _ = out.shape
+        out = out.view(b, t, self.heads, self.dim_head)
+        out.mul_(gates.unsqueeze(-1))
+        return out.view(b, t, self.heads * self.dim_head)
+
+    def _attention_out(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: torch.Tensor | None = None,
+        k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
+    ) -> torch.Tensor:
+        """Attention output before ``to_out`` (see :meth:`forward`)."""
+        context = x if context is None else context
+        v = self.to_v(context)
+
+        if all_perturbed:
+            out = v
+        else:
+            q = self.q_norm(self.to_q(x))
+            k = self.k_norm(self.to_k(context))
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            out = self._attend(q, k, v, mask)
+            del q, k
+            if perturbation_mask is not None:
+                out = out * perturbation_mask + v * (1 - perturbation_mask)
+        return self._gate_heads(out, x)
+
+    def _add_projected(self, residual: torch.Tensor, out: torch.Tensor, outer_gate: torch.Tensor | None) -> None:
+        """``residual += to_out(out) * outer_gate``, projected in token chunks.
+        Avoids holding the full pre-projection output and a full projected copy at once.
+        ``outer_gate`` may have one row per token or a single row that broadcasts.
+        """
+        chunk_tokens = self._out_chunk_tokens()
+        tokens = out.shape[1]
+        per_token_gate = outer_gate is not None and outer_gate.shape[1] != 1
+        for start in range(0, tokens, chunk_tokens):
+            stop = min(start + chunk_tokens, tokens)
+            projected = self.to_out(out[:, start:stop])
+            if outer_gate is not None:
+                projected.mul_(outer_gate[:, start:stop] if per_token_gate else outer_gate)
+            residual[:, start:stop].add_(projected)
+            del projected
+
+    def add_to_residual(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        outer_gate: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: torch.Tensor | None = None,
+        k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
+    ) -> torch.Tensor:
+        """In-place ``residual += forward(x, ...) * outer_gate`` without a full projected copy."""
+        out = self._attention_out(
+            x,
+            context=context,
+            mask=mask,
+            pe=pe,
+            k_pe=k_pe,
+            perturbation_mask=perturbation_mask,
+            all_perturbed=all_perturbed,
+        )
+        self._add_projected(residual, out, outer_gate)
+        del out
+        return residual
+
+    def project_kv(
+        self, context: torch.Tensor, k_pe: tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keys (normalized, rotated) and values of ``context``, exactly as :meth:`forward` computes them."""
+        v = self.to_v(context)
+        k = self.k_norm(self.to_k(context))
+        if k_pe is not None:
+            k = apply_rotary_emb(k, k_pe, self.rope_type)
+        return k, v
+
+    def add_chunk_to_residual(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        outer_gate: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """:meth:`add_to_residual` for a slice of queries against keys/values from :meth:`project_kv`.
+        ``residual``, ``x``, ``outer_gate``, ``pe`` and the mask rows cover the same tokens;
+        ``k``/``v`` cover the whole context. Attention rows are independent, so the result
+        equals the matching rows of the unchunked call.
+        """
+        q = self.q_norm(self.to_q(x))
+        if pe is not None:
+            q = apply_rotary_emb(q, pe, self.rope_type)
+        out = self._attend(q, k, v, mask)
+        del q
+        out = self._gate_heads(out, x)
+        self._add_projected(residual, out, outer_gate)
+        del out
+        return residual
+
     def forward(
         self,
         x: torch.Tensor,
@@ -543,36 +672,13 @@ class Attention(torch.nn.Module):
         Returns:
             Output tensor of shape ``(B, T, query_dim)``.
         """
-        context = x if context is None else context
-        use_attention = not all_perturbed
-
-        v = self.to_v(context)
-
-        if not use_attention:
-            out = v
-        else:
-            q = self.to_q(x)
-            k = self.to_k(context)
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-            if pe is not None:
-                q = apply_rotary_emb(q, pe, self.rope_type)
-                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
-            if mask is None:
-                out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
-            else:
-                out = self.masked_attention_function(q, k, v, self.heads, mask)
-
-            if perturbation_mask is not None:
-                out = out * perturbation_mask + v * (1 - perturbation_mask)
-
-        # Apply per-head gating if enabled
-        if self.to_gate_logits is not None:
-            gate_logits = self.to_gate_logits(x)
-            b, t, _ = out.shape
-            out = out.view(b, t, self.heads, self.dim_head)
-            gates = 2.0 * torch.sigmoid(gate_logits)
-            out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, self.heads * self.dim_head)
-
+        out = self._attention_out(
+            x,
+            context=context,
+            mask=mask,
+            pe=pe,
+            k_pe=k_pe,
+            perturbation_mask=perturbation_mask,
+            all_perturbed=all_perturbed,
+        )
         return self.to_out(out)

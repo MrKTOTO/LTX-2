@@ -33,12 +33,14 @@ class BlockStreamingWrapper(nn.Module, Disposable):
         blocks: nn.ModuleList,
         provider: WeightsProvider,
         target_device: torch.device,
+        prefetch_next: bool = False,
     ) -> None:
         super().__init__()
         self._model = model
         self._blocks = blocks
         self._target_device = target_device
         self._provider = provider
+        self._prefetch_next = prefetch_next and provider.can_prefetch
 
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._register_hooks()
@@ -62,8 +64,19 @@ class BlockStreamingWrapper(nn.Module, Disposable):
     def _post_hook(self, block_idx: int) -> None:
         """Release the block weights once its forward pass has been enqueued.
         The provider guards the buffer against reuse until this block's compute
-        completes."""
+        completes. With prefetching, the next block's weights start copying now, so
+        the transfer overlaps this block's compute instead of following it."""
         self._provider.mark_block_done(block_idx)
+        if self._prefetch_next:
+            self._provider.prefetch((block_idx + 1) % len(self._blocks))
+
+    def resident_block_window(self) -> int:
+        """How many consecutive blocks can be applied repeatedly without reloading.
+        Scene-batched denoising runs a window of blocks for every clip before moving
+        on; a window larger than this would make each clip evict the block the next
+        clip needs.
+        """
+        return self._provider.resident_capacity()
 
     def _register_hooks(self) -> None:
         for idx, block in enumerate(self._blocks):

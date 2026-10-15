@@ -9,7 +9,7 @@ import torch
 
 from ltx_core.block_streaming.disk import LoraSource
 from ltx_core.block_streaming.pool import BufferPool
-from ltx_core.block_streaming.source import WeightSource
+from ltx_core.block_streaming.source import MappedWeightSource, WeightSource
 from ltx_core.block_streaming.stream_sync import StreamEvent, StreamSync
 from ltx_core.block_streaming.utils import carve_buffer, layout_nbytes
 from ltx_core.loader.fuse_loras import FuseRule, aggregate_lora_products, bf16_fuse_rule, device_fuse_rule
@@ -40,6 +40,8 @@ class WeightsProvider:
         blocks_prefix: State-dict prefix for LoRA key matching.
         fuse_rule: Per-policy LoRA merge rule (must be streaming-compatible:
             no companion-key emission). Defaults to ``bf16_fuse_rule``.
+        prefetch_next: Whether the wrapper copies the next block while the current one
+            computes (see :meth:`prefetch`).
     """
 
     def __init__(
@@ -51,6 +53,7 @@ class WeightsProvider:
         lora_sources: list[LoraSource] | None = None,
         blocks_prefix: str = "",
         fuse_rule: FuseRule = bf16_fuse_rule,
+        prefetch_next: bool = False,
     ) -> None:
         self._sync = sync
         self._pool = pool
@@ -61,27 +64,60 @@ class WeightsProvider:
         self._lora_sources = lora_sources or []
         self._blocks_prefix = blocks_prefix
         self._fuse_rule = fuse_rule
+        self._pending_copies: dict[int, StreamEvent] = {}
+        self._prefetch_next = prefetch_next
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return GPU weights for block *idx*. Does H2D copy on miss."""
-        if idx in self._cache:
-            return self._cache[idx].views
+        if idx not in self._cache:
+            self._load(idx, defer_wait=False)
+        pending = self._pending_copies.pop(idx, None)
+        if pending is not None:
+            self._sync.wait_copy(pending)
+        return self._cache[idx].views
 
+    @property
+    def can_prefetch(self) -> bool:
+        """Whether :meth:`prefetch` can copy ahead (needs deferred copy waits and two slots)."""
+        return hasattr(self._sync, "record_copy") and self._pool.capacity >= 2
+
+    def prefetch(self, idx: int) -> None:
+        """Start copying block *idx* now; compute waits for it only in :meth:`get`.
+        Called once the previous block's compute has been enqueued, so the copy overlaps
+        it. Evicts the least recently loaded block, which is never the one in use as long
+        as there are at least two slots.
+        """
+        if idx in self._cache or not self.can_prefetch:
+            return
+        self._load(idx, defer_wait=True)
+
+    def resident_capacity(self) -> int:
+        """How many consecutive blocks stay on the GPU while being reused.
+        With prefetching one slot always holds the next block, so only the others can
+        keep a run of blocks resident across repeated calls.
+        """
+        return 1 if self._prefetch_next and self.can_prefetch else self._pool.capacity
+
+    def _load(self, idx: int, defer_wait: bool) -> None:
         # Evict oldest GPU buffer if at capacity.
         if len(self._cache) >= self._pool.capacity:
             evicted_idx, evicted = self._cache.popitem(last=False)
+            self._pending_copies.pop(evicted_idx, None)
             self._pool.release(evicted.raw, event=self._events.pop(evicted_idx, None))
 
         layout = self._source.block_layout(idx)
         raw = self._pool.acquire()
         gpu_weights = carve_buffer(raw, layout)
-        cpu_buffer = self._source.get(idx)
-
-        h2d_event = self._copy_to_gpu(idx, raw, gpu_weights, cpu_buffer, layout_nbytes(layout))
+        if isinstance(self._source, MappedWeightSource):
+            h2d_event = self._copy_tensors_to_gpu(idx, gpu_weights, self._source.tensors(idx), defer_wait)
+        else:
+            cpu_buffer = self._source.get(idx)
+            h2d_event = self._copy_to_gpu(idx, raw, gpu_weights, cpu_buffer, layout_nbytes(layout), defer_wait)
         self._source.release(idx, event=h2d_event)
+        if defer_wait:
+            self._pending_copies[idx] = h2d_event
 
         self._cache[idx] = CachedBlock(raw, gpu_weights)
-        return gpu_weights
 
     def _copy_to_gpu(
         self,
@@ -90,6 +126,7 @@ class WeightsProvider:
         gpu_weights: dict[str, torch.Tensor],
         cpu_buffer: torch.Tensor,
         nbytes: int,
+        defer_wait: bool = False,
     ) -> StreamEvent | None:
         """Copy block weights to the target device and fuse LoRAs.
         *cpu_buffer* is one contiguous source buffer carved by the same layout as
@@ -111,7 +148,22 @@ class WeightsProvider:
             if self._lora_sources:
                 self._fuse_block_loras(idx, gpu_weights)
 
-        return self._sync.commit_copy()
+        return self._sync.record_copy() if defer_wait else self._sync.commit_copy()
+
+    def _copy_tensors_to_gpu(
+        self,
+        idx: int,
+        gpu_weights: dict[str, torch.Tensor],
+        cpu_tensors: dict[str, torch.Tensor],
+        defer_wait: bool,
+    ) -> StreamEvent | None:
+        """:meth:`_copy_to_gpu` for a source without contiguous block buffers, one tensor at a time."""
+        with self._sync.copy_scope():
+            for name, gpu_tensor in gpu_weights.items():
+                gpu_tensor.copy_(cpu_tensors[name], non_blocking=self._sync.is_async_copy)
+            if self._lora_sources:
+                self._fuse_block_loras(idx, gpu_weights)
+        return self._sync.record_copy() if defer_wait else self._sync.commit_copy()
 
     def release(self, idx: int, event: StreamEvent | None) -> None:
         """Attach a compute-done guard, waited before this buffer is recycled
@@ -129,6 +181,7 @@ class WeightsProvider:
         self._sync.synchronize()
         self._cache.clear()
         self._events.clear()
+        self._pending_copies.clear()
         self._source.cleanup()
         for lora in self._lora_sources:
             lora.cleanup()

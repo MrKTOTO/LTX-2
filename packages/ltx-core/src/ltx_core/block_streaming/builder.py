@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final, Generic
 
@@ -13,10 +14,16 @@ from torch import nn
 
 from ltx_core.block_streaming import utils as bs_utils
 from ltx_core.block_streaming.block_fetcher import BlockFetcher
-from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource
+from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource, MappedSafetensors
 from ltx_core.block_streaming.pool import BufferPool
 from ltx_core.block_streaming.provider import WeightsProvider
-from ltx_core.block_streaming.source import DiskWeightSource, PinnedBlock, PinnedWeightSource, WeightSource
+from ltx_core.block_streaming.source import (
+    DiskWeightSource,
+    MappedWeightSource,
+    PinnedBlock,
+    PinnedWeightSource,
+    WeightSource,
+)
 from ltx_core.block_streaming.stream_sync import create_stream_sync
 from ltx_core.block_streaming.utils import (
     carve_buffer,
@@ -246,13 +253,21 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
         cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else self._cpu_slots_count
         cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else len(blocks)
-        gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _DEFAULT_GPU_SLOTS
+        gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _env_gpu_slots()
 
         if cpu_slots_count >= len(blocks):
             lora_sd_and_strengths = self._load_lora_sds()
-            source, lora_sources = self._build_pinned_source(
-                blocks, dtype, cpu_slots_count, block_key_map, lora_sd_and_strengths
-            )
+            mode = _cpu_stream_mode()
+            if lora_sd_and_strengths:
+                source, lora_sources = self._build_pinned_source(
+                    blocks, dtype, cpu_slots_count, block_key_map, lora_sd_and_strengths
+                )
+            elif mode == "mmap":
+                source, lora_sources = self._build_mapped_source(blocks, dtype, checkpoint_paths, block_key_map)
+            else:
+                source, lora_sources = self._build_ram_source(
+                    blocks, dtype, checkpoint_paths, block_key_map, pin_memory=mode == "pinned"
+                )
             non_block_loras = lora_sd_and_strengths
         else:
             reader = DiskTensorReader(checkpoint_paths)
@@ -273,12 +288,14 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             lora_sources,
             self.blocks_prefix,
             fuse_rule=self.fuse_rule,
+            prefetch_next=_prefetch_next_enabled(),
         )
         return BlockStreamingWrapper(
             model=meta_model,
             blocks=blocks,
             provider=provider,
             target_device=device,
+            prefetch_next=_prefetch_next_enabled(),
         )
 
     def _load_lora_sds(self) -> list[LoraStateDictWithStrength]:
@@ -363,6 +380,93 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         pinned = {idx: PinnedBlock(pinned_buffers[idx], block_layouts[idx]) for idx in pinned_buffers}
         return PinnedWeightSource(pinned), []
 
+    def _build_ram_source(
+        self,
+        blocks: nn.ModuleList,
+        dtype: torch.dtype,
+        checkpoint_paths: list[str],
+        block_key_map: dict[int, list[tuple[str, str]]],
+        pin_memory: bool = False,
+    ) -> tuple[WeightSource, list[LoraSource]]:
+        """Pre-load every block into its own CPU buffer, reading the checkpoint block by block.
+        :meth:`_build_pinned_source` materializes the whole block state dict before copying it
+        into the per-block buffers, so a 42 GB transformer peaks at ~84 GB of host memory. Here
+        each block is read straight into its buffer, so the peak is the buffers themselves.
+        The buffers are pageable unless ``LTX_CPU_STREAM_MODE=pinned``: registering tens of GB
+        with CUDA fails on Windows long before RAM runs out, and H2D copies from pageable
+        memory still work, only less asynchronously. Used when no LoRA has to be fused.
+        """
+        reader = DiskBlockReader(
+            reader=DiskTensorReader(checkpoint_paths),
+            block_key_map=block_key_map,
+            sd_ops=self.model_sd_ops,
+            blocks_prefix=self.blocks_prefix,
+        )
+        block_layouts = _block_layouts(blocks, block_key_map, dtype)
+        loaded: dict[int, PinnedBlock] = {}
+        try:
+            for block_idx in sorted(block_key_map):
+                layout = block_layouts[block_idx]
+                buffer = bs_utils.alloc_buffer(layout_nbytes(layout), torch.device("cpu"), pin_memory=pin_memory)
+                reader.read_into(carve_buffer(buffer, layout), block_idx)
+                loaded[block_idx] = PinnedBlock(buffer, layout)
+        finally:
+            reader.cleanup()
+        logger.info(
+            "Loaded %d streamed blocks into %s CPU memory (%.1f GB)",
+            len(loaded),
+            "pinned" if pin_memory else "pageable",
+            sum(block.buffer.numel() for block in loaded.values()) / 1024**3,
+        )
+        return PinnedWeightSource(loaded), []
+
+    def _build_mapped_source(
+        self,
+        blocks: nn.ModuleList,
+        dtype: torch.dtype,
+        checkpoint_paths: list[str],
+        block_key_map: dict[int, list[tuple[str, str]]],
+    ) -> tuple[WeightSource, list[LoraSource]]:
+        """Serve blocks straight from memory-mapped checkpoints (``LTX_CPU_STREAM_MODE=mmap``).
+        See :class:`MappedWeightSource`. Key renames from ``model_sd_ops`` are already in
+        ``block_key_map``; value transforms are applied the way :class:`DiskBlockReader` does.
+        """
+        files = {path: MappedSafetensors(path) for path in checkpoint_paths}
+        key_to_file = {key: mapped for mapped in files.values() for key in mapped.tensor_names()}
+        block_layouts = _block_layouts(blocks, block_key_map, dtype)
+        block_tensors: dict[int, dict[str, torch.Tensor]] = {}
+        converted = 0
+        for block_idx, entries in block_key_map.items():
+            layout = block_layouts[block_idx]
+            block_prefix = make_block_key(self.blocks_prefix, block_idx, "")
+            tensors: dict[str, torch.Tensor] = {}
+            for sft_key, param_name in entries:
+                tensor = key_to_file[sft_key].view(sft_key)
+                results = (
+                    [(param_name, tensor)]
+                    if self.model_sd_ops is None
+                    else [
+                        (result.new_key[len(block_prefix) :], result.new_value)
+                        for result in self.model_sd_ops.apply_to_key_value(
+                            make_block_key(self.blocks_prefix, block_idx, param_name), tensor
+                        )
+                    ]
+                )
+                for name, value in results:
+                    target_dtype = layout[name][1]
+                    if value.dtype != target_dtype:
+                        converted += 1
+                    tensors[name] = value if value.dtype == target_dtype else value.to(target_dtype)
+            block_tensors[block_idx] = tensors
+        logger.info(
+            "Serving %d streamed blocks from %d memory-mapped file(s) (%d small tensors converted to %s)",
+            len(block_tensors),
+            len(files),
+            converted,
+            dtype,
+        )
+        return MappedWeightSource(block_tensors, block_layouts, [mapped.mapping for mapped in files.values()]), []
+
     def _build_disk_source(
         self,
         blocks: nn.ModuleList,
@@ -437,6 +541,27 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 non_block_sd[key] = fused
 
         model.load_state_dict(non_block_sd, strict=False, assign=True)
+
+
+def _cpu_stream_mode() -> str:
+    """How ``--offload cpu`` keeps streamed blocks (``LTX_CPU_STREAM_MODE``): ram, pinned or mmap."""
+    mode = os.environ.get("LTX_CPU_STREAM_MODE", "ram").strip().lower()
+    if mode not in ("ram", "pinned", "mmap"):
+        raise ValueError(f"LTX_CPU_STREAM_MODE must be ram, pinned or mmap, got {mode!r}")
+    return mode
+
+
+def _prefetch_next_enabled() -> bool:
+    """Copy the next block while the current one computes (``LTX_STREAM_PREFETCH_NEXT``, on by default)."""
+    return os.environ.get("LTX_STREAM_PREFETCH_NEXT", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_gpu_slots() -> int:
+    """GPU weight slots (``LTX_STREAM_GPU_SLOTS``; default 2, the block in use and the next one)."""
+    try:
+        return max(1, int(os.environ.get("LTX_STREAM_GPU_SLOTS", _DEFAULT_GPU_SLOTS)))
+    except ValueError:
+        return _DEFAULT_GPU_SLOTS
 
 
 def _block_state(block: nn.Module) -> dict[str, torch.Tensor]:

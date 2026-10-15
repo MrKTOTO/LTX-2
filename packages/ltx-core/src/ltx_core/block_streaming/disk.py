@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import mmap
+import struct
+import warnings
 from collections.abc import Iterator
 
 import safetensors
@@ -45,6 +49,59 @@ class DiskTensorReader:
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._key_to_handle_idx)
+
+
+_SAFETENSORS_HEADER_DTYPES: dict[str, torch.dtype] = {
+    **_SAFETENSORS_DTYPE_TO_TORCH,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+class MappedSafetensors:
+    """Zero-copy tensor views of one memory-mapped safetensors file."""
+
+    def __init__(self, path: str) -> None:
+        with open(path, "rb") as handle:
+            header_size = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(header_size))
+            self._mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        header.pop("__metadata__", None)
+        self._entries = header
+        self._data_start = 8 + header_size
+
+    def tensor_names(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def view(self, key: str) -> torch.Tensor:
+        """The tensor stored under *key*, backed by the file mapping (read-only; never write to it)."""
+        entry = self._entries[key]
+        dtype = _SAFETENSORS_HEADER_DTYPES[entry["dtype"]]
+        shape = entry["shape"]
+        begin, end = entry["data_offsets"]
+        if begin == end:
+            return torch.empty(shape, dtype=dtype)
+        with warnings.catch_warnings():
+            # A read-only mapping makes torch warn that the tensor is not writable; it is
+            # only ever read (copied to the GPU).
+            warnings.simplefilter("ignore", UserWarning)
+            flat = torch.frombuffer(
+                self._mapping,
+                dtype=dtype,
+                count=(end - begin) // dtype.itemsize,
+                offset=self._data_start + begin,
+            )
+        return flat.view(shape)
+
+    @property
+    def mapping(self) -> mmap.mmap:
+        return self._mapping
 
 
 class DiskBlockReader:

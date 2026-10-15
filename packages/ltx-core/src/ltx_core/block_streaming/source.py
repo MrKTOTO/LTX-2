@@ -139,6 +139,56 @@ class DiskWeightSource(WeightSource):
         return _Scheduled(raw_buffer, status)
 
 
+class MappedWeightSource:
+    """Block weights served straight from memory-mapped safetensors files.
+    Nothing is copied at build time: every streamed tensor is a view of the file mapping
+    (tensors whose dtype differs from the layout are converted once; in LTX checkpoints
+    those are a few small float32 tables). Under memory pressure the OS drops mapped pages
+    and re-reads them from the checkpoint, where a RAM copy of the weights would be written
+    to the page file and read back from it. Not a contiguous source: the provider copies
+    block tensors one by one (:meth:`tensors`).
+    """
+
+    def __init__(
+        self,
+        block_tensors: dict[int, dict[str, torch.Tensor]],
+        block_layouts: dict[int, TensorLayout],
+        mappings: list[object],
+    ) -> None:
+        if not block_tensors:
+            raise ValueError("MappedWeightSource requires at least one block")
+        self._block_tensors = block_tensors
+        self._block_layouts = block_layouts
+        self._mappings = mappings
+        self._slot_nbytes = max(layout_nbytes(layout) for layout in block_layouts.values())
+
+    def block_layout(self, idx: int) -> TensorLayout:
+        return self._block_layouts[idx]
+
+    @property
+    def slot_nbytes(self) -> int:
+        return self._slot_nbytes
+
+    def tensors(self, idx: int) -> dict[str, torch.Tensor]:
+        """Block *idx*'s tensors by parameter name, in the layout's dtypes."""
+        return self._block_tensors[idx]
+
+    def get(self, idx: int) -> torch.Tensor:  # noqa: ARG002
+        raise TypeError("MappedWeightSource has no contiguous block buffers; copy tensors() instead")
+
+    def release(self, idx: int, event: StreamEvent | None) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        # Views of a mapping must be gone before it closes; dropping the last reference
+        # lets the mapping close itself.
+        self._block_tensors.clear()
+        self._mappings.clear()
+
+    def __len__(self) -> int:
+        return len(self._block_tensors)
+
+
 class PinnedBlock(NamedTuple):
     """A pre-loaded pinned block: its single contiguous buffer and the layout to carve it with."""
 
